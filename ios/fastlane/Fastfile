@@ -1,0 +1,55 @@
+# Fastfile for Otonomiq & Frontez Engine Brands
+default_platform(:ios)
+
+platform :ios do
+  desc "Build IPA and upload to App Store Connect / TestFlight"
+  lane :beta do
+    sh("security unlock-keychain -p '' ~/Library/Keychains/login.keychain-db 2>/dev/null || security unlock-keychain -p '' ~/Library/Keychains/login.keychain 2>/dev/null || true")
+    sh("xattr -cr .. 2>/dev/null || true")
+    sh("unset GEM_HOME GEM_PATH RUBYLIB; cd .. && flutter build ipa --release")
+    
+    # Resolve real path of the flutter build directory to handle symlinks like /tmp/<app>_build
+    possible_build_dirs = ["../../build", "../build", "build"].select { |p| File.exist?(p) }.map { |p| File.realpath(p) }
+    ipa_path = possible_build_dirs.map { |d| Dir["#{d}/ios/ipa/*.ipa"].first }.compact.first
+    
+    # Locate any AuthKey_*.p8 file in fastlane directory or ios directory
+    p8_files = Dir["fastlane/AuthKey_*.p8"] + Dir["AuthKey_*.p8"]
+    
+    UI.message("Found IPA file: #{ipa_path}")
+    
+    if ipa_path.nil? || !File.exist?(ipa_path)
+      UI.user_error!("❌ No .ipa file found in build output directories. The archive was created, but Xcode could not export the IPA. Please open Xcode -> Settings -> Accounts and ensure your Apple ID session (admin@autsorz.io) is signed in and active.")
+    end
+    
+    if p8_files.any?
+      p8_file = File.expand_path(p8_files.first)
+      key_id = File.basename(p8_file, ".p8").sub("AuthKey_", "")
+      issuer_id = ENV["APP_STORE_CONNECT_ISSUER_ID"] || "37e3df4e-280e-4b95-bd06-5d1f88da7828"
+      
+      UI.message("Authenticating with App Store Connect API Key: #{key_id} (file: #{p8_file})")
+      
+      api_key = app_store_connect_api_key(
+        key_id: key_id,
+        issuer_id: issuer_id,
+        key_filepath: p8_file
+      )
+      
+      upload_to_testflight(
+        api_key: api_key,
+        ipa: ipa_path,
+        skip_waiting_for_build_processing: true
+      )
+    else
+      upload_to_testflight(
+        ipa: ipa_path,
+        skip_waiting_for_build_processing: true
+      )
+    end
+  end
+
+  desc "Build IPA locally without uploading"
+  lane :build do
+    sh("xattr -cr .. 2>/dev/null || true")
+    sh("unset GEM_HOME GEM_PATH RUBYLIB; cd .. && flutter build ipa --release")
+  end
+end
