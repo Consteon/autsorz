@@ -1,0 +1,95 @@
+# Fastfile for Android - Otonomiq & Frontez Engine Brands
+default_platform(:android)
+
+platform :android do
+  desc "Upload Android AppBundle (.aab) to Google Play Console Internal Testing track"
+  lane :internal do |options|
+    package_name = options[:package_name] || "com.autsorz.mobile"
+    aab_path = options[:aab_path] || Dir["../../frontez-releases/*.aab"].last || Dir["../build/app/outputs/bundle/release/*.aab"].first
+    
+    key_file = ENV["GOOGLE_PLAY_KEY_PATH"] || File.expand_path("~/.fastlane/google-play-key.json")
+    if !File.exist?(key_file) && File.exist?(File.expand_path("google-play-key.json", __dir__))
+      key_file = File.expand_path("google-play-key.json", __dir__)
+    end
+    
+    # Copy AAB to /tmp to avoid Google Drive cloud sync locks or slow I/O buffering during upload
+    local_aab = "/tmp/#{File.basename(aab_path)}"
+    if File.exist?(aab_path) && aab_path != local_aab
+      FileUtils.cp(aab_path, local_aab)
+      upload_file = local_aab
+    else
+      upload_file = aab_path
+    end
+
+    UI.message("Uploading AAB file: #{upload_file} for package: #{package_name} to Google Play Internal Track using key: #{key_file}")
+    
+    max_retries = 3
+    attempt = 0
+    current_aab = upload_file
+
+    begin
+      attempt += 1
+      upload_to_play_store(
+        package_name: package_name,
+        track: "internal",
+        aab: current_aab,
+        json_key: key_file,
+        timeout: 1800,
+        skip_upload_apk: true,
+        skip_upload_metadata: true,
+        skip_upload_images: true,
+        skip_upload_screenshots: true,
+        skip_upload_changelogs: true
+      )
+    rescue => ex
+      err_msg = ex.message.to_s
+      if err_msg.include?("already been used") || err_msg.include?("Version code")
+        UI.important("⚠️ Google Play Version Code collision detected. Incrementing build number in pubspec.yaml and rebuilding...")
+        
+        pubspec_path = File.expand_path("../../pubspec.yaml", __dir__)
+        if File.exist?(pubspec_path)
+          content = File.read(pubspec_path)
+          if content =~ /^version:\s*([^\s+]+)\+(\d+)/
+            ver_name = $1
+            old_build = $2.to_i
+            new_build = old_build + 1
+            new_version_line = "version: #{ver_name}+#{new_build}"
+            
+            updated_content = content.sub(/^version:.*/, new_version_line)
+            File.write(pubspec_path, updated_content)
+            
+            main_pubspec = "/Users/harryhuang/Library/CloudStorage/GoogleDrive-hsangkanparan@consteon.com/Shared drives/authenium/Main/01_Authenium/Dev/apps/frontez-engine/otonomiq-main/pubspec.yaml"
+            if File.exist?(main_pubspec)
+              m_content = File.read(main_pubspec)
+              File.write(main_pubspec, m_content.sub(/^version:.*/, new_version_line))
+              sh("cd '#{File.dirname(main_pubspec)}' && git add pubspec.yaml 2>/dev/null && git commit -m 'Auto-bump version to #{new_version_line} [ci skip]' 2>/dev/null && git push origin main 2>/dev/null || true")
+            end
+
+            UI.message("Updated pubspec.yaml version to: #{new_version_line}")
+
+            # Rebuild AAB
+            sh("unset GEM_HOME GEM_PATH RUBYLIB; cd ../.. && flutter build appbundle --release")
+            
+            new_built_aab = File.expand_path("../../build/app/outputs/bundle/release/app-release.aab", __dir__)
+            local_new_aab = "/tmp/#{File.basename(aab_path).sub(/_\d+\.aab$/, "_#{new_build}.aab")}"
+            FileUtils.cp(new_built_aab, local_new_aab)
+            current_aab = local_new_aab
+            
+            UI.message("Retrying Google Play upload with newly built AAB: #{current_aab}")
+            retry
+          else
+            raise ex
+          end
+        else
+          raise ex
+        end
+      elsif attempt < max_retries
+        UI.important("⚠️ Google Play upload failed with error: #{err_msg.strip} (attempt #{attempt}/#{max_retries}). Retrying in 15 seconds...")
+        sleep(15)
+        retry
+      else
+        raise ex
+      end
+    end
+  end
+end
