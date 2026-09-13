@@ -1,0 +1,113 @@
+ /*
+  vertika_demo
+  
+  pieces of code that can be different among app variant. Current build variants are :
+    vertika      (vertika)
+    vertika demo (vertika_demo)
+    agenia       (agenia)
+    agenia demo  (agenia_demo)
+    autsorz
+
+  there are other files that different
+    pubspec.yaml
+    android/app/src/main/res/drawable/launch_image_png
+    ic_launcher.png (logo) in :
+      android/app/src/main/res/mipmap-hdpi
+      android/app/src/main/res/mipmap-mdpi
+      android/app/src/main/res/mipmap-xhdpi
+      android/app/src/main/res/mipmap-xxhdpi
+      android/app/src/main/res/mipmap-xxxhdpi
+
+   app name (https://www.woolha.com/tutorials/flutter-change-app-launcher-icon-name-android-ios)
+   android/app/src/main/AndroidManifest.xml (for android only)
+   ios/Runner/Info.plist (for ios only)
+
+   app Id / package name (https://stackoverflow.com/questions/51534616/how-to-change-package-name-in-flutter)
+     android/app/build.gradle
+     android/app/src/main/AndroidManifest.xml (for android only)
+     android/app/src/java/com/vertika/vdemo/MainActivity.java
+     rename folder above to android/app/src/java/com/<COMPANY>/<APPNAME>
+
+   appsKey :
+    1 = Autsorz
+    2 = Schania
+    3 = Agenia
+
+ */
+ // LoginForm
+
+ //
+ // xbfgg
+
+ const bool demoVersion = false;
+ const appName = 'Autsorz';
+ const appsKey = "1";             		//= will be used for cloud function. Should be an Apps Id.
+ const bool devModeConst = false; 		// true : using devSystem; false using system
+ const defaultAppVid = 70027002611015;
+ const tableVid = 20342033315492;        //= conteon for autsorz. Folder of all table in firestore under MobileTable
+ const defaultCloudConfig = {
+  "minimumVersion" : "0.9.12",
+  "minVerRoute" : "error809",
+  "guestUpgradeIdx" : 7,
+  "vmUpgradeIdx" : 8,
+  "guestRoute" : "signInAutsorz",
+  "location" : "{}",
+  "locRange" : "op1!I12:M211",
+  "systemRange" : "JSON!B6:E49",
+  "screenRange" : "JSON!B51:E",
+  "screenRange2" : "JSON2!B51:E",
+  "testInterfaceKey" : "13HZHLrfzf8y-5YBGN76n_u6BrZx0V_gebn2y971tRXw",
+  "signupLif" : "18MAwk8_l2ADCpuOPaQAzMykDpTZZhVFjP1n5Kcn_RTk",
+  "signupIdx" : 2,
+  "signupDemo" : "1B0tI2O89HtDY-t_yt9-_QP9MrkmFSwRNymfSYPAZai8",
+  "vidKey" : "1LVZIncIFXQsUaG_DDmIEJai4-by-ZpyDhTYFk4DjFk8",
+  "devInterfaceKey" : "1btHbSqofEmIvHo1W2oHsv0Tnfuli_ZWcUtxDm1UWe7o",
+  "devSystemRange" : "Json!B6:E49",
+  "devScreenRange" : "Json!B51:E",
+  "localeChecksum" : "Locale!B15",
+  "localeRange" : "Locale!B17:C"
+ };
+ const defaultOfflineLoginPage = {
+   // autsorz
+   "title": "Sign In",
+   "children": [
+     {
+       "type": "IMG",
+       "url":
+           "https://firebasestorage.googleapis.com/v0/b/otq-01-ase2/o/c%2Fautsorz%2Fimage%2Fautsorz-signup-300x70.png?alt=media&token=fdf74314-429c-4c1e-bd31-a857e6f4b744",
+       "height": 120,
+       "alignment": "left",
+       "beforeSpacing": 0,
+       "afterSpacing": 0
+     },
+     {
+       "type": "SIGNUP",
+       "left": "TRUE",
+       "leftPadding": 0,
+       "rightPadding": 0,
+       "beforeSpacing": 10,
+       "afterSpacing": 0,
+       "font": "default",
+       "size": 18,
+       "color": "FF001A72",
+       "text1":
+           "Saya telah membaca dan setuju dengan Syarat dan Ketentuan, Pemberitahuan Privasi, dan Peraturan Layanan tertulis di link ini.",
+       "text2": "Saya Setuju",
+       "text3": "Nomor Ponsel Terdaftar",
+       "text4": "Contoh : 08xxx",
+       "text5": "Masuk",
+       "text6": "Nomor ponsel tidak valid",
+       "text7": "Nomor undangan sudah kadaluarsa",
+       "text8": "Ada user lain yang sign up dengan Google account ini",
+       "text9": "Ada user lain yang sign up dengan Facebook account ini",
+       "text10": "Ada user lain yang sign up dengan Twitter account ini",
+       "text11": "Akun dalam kondisi terblokir",
+       "text12": "Login gagal",
+       "route": "_Invitation",
+       "google": "Masuk menggunakan Google"
+     }
+   ]
+ };
+ final defaultGuestLine = defaultCloudConfig["signupIdx"]; // login page in guess | Proxy JSON row 50 + defaultGuessLine
+ final String defaultGuestHome = defaultCloudConfig["guestRoute"].toString(); // login page in guess | Proxy JSON row 50 + defaultGuessLine
+

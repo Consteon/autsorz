@@ -1,0 +1,546 @@
+import '../global.dart'; // diamondTextToList
+import 'admin_home_support.dart'; // evaluateGate
+
+// ─── Note template resolution ───────────────────────────────────────────────
+
+/// Mirrors panel_card_support.dart:336 — kept character-identical on purpose.
+final RegExp _noteAngleToken = RegExp(r'<([a-zA-Z][a-zA-Z0-9]*)>');
+
+/// Resolve an optional display template (`note`). Returns `''` when the
+/// template is blank, or when it contains `<field>` tokens and ANY of them
+/// is missing/blank on [doc] — a half-resolved line ("Level  dari ") is
+/// worse than no line. A token-free template renders as-is.
+String resolveNoteTemplate(String template, Map<String, dynamic> doc) {
+  if (template.trim().isEmpty) return '';
+  final Iterable<RegExpMatch> matches = _noteAngleToken.allMatches(template);
+  if (matches.isEmpty) return template; // token-free note — render as-is
+  for (final m in matches) {
+    final dynamic val = doc[m.group(1)];
+    if (val == null || val.toString().trim().isEmpty) return '';
+  }
+  // All tokens present and non-empty — substitute.
+  return template.replaceAllMapped(_noteAngleToken, (m) {
+    final dynamic val = doc[m.group(1)];
+    return val == null ? '' : val.toString();
+  });
+}
+
+// ─── LIST_CARD support — pure parsers ─────────────────────────────────────
+
+/// Parsed badge definition from the `badgeMap` config field.
+class BadgeEntry {
+  final String value;
+  final String label;
+  final String tier; // danger|warn|ok|info
+  const BadgeEntry(this.value, this.label, this.tier);
+}
+
+/// Parsed group label from the `groupLabels` config field.
+class GroupLabelEntry {
+  final String value;
+  final String label;
+  const GroupLabelEntry(this.value, this.label);
+}
+
+/// Parsed stats box definition from the `stats` config field.
+class StatsDef {
+  final String label;
+  final String filter; // gate DSL string; empty = count all
+  const StatsDef(this.label, this.filter);
+}
+
+/// Parse `badgeMap`: `value◼Label◼tier★value2◼Label2◼tier2`.
+///
+/// Tier defaults to `'info'` when absent or empty. `'neutral'` aliases to
+/// `'info'` (panel_card_support statusColor/statusBgColor handle danger/warn/
+/// ok/info — neutral is not a known tier there, so we map it to info which
+/// renders as blue, the closest semantic neutral).
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling.
+List<BadgeEntry> parseBadgeMap(String raw) {
+  if (raw.trim().isEmpty) return const [];
+  final List<BadgeEntry> out = [];
+  for (final part in raw.split('\u{2605}')) {
+    // ★ separates entries
+    final String trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final List<String> segs = trimmed.split('\u{25FC}'); // ◼
+    final String value = segs.isNotEmpty ? segs[0].trim() : '';
+    if (value.isEmpty) continue;
+    final String label = segs.length > 1
+        ? segs[1].trim()
+        : value; // ponytail: missing label = value
+    String tier = segs.length > 2 ? segs[2].trim().toLowerCase() : 'info';
+    if (tier == 'neutral') tier = 'info';
+    if (tier.isEmpty) tier = 'info';
+    out.add(BadgeEntry(value, label, tier));
+  }
+  return out;
+}
+
+/// Parse `groupLabels`: `value◼Label★value2◼Label2`.
+///
+/// Order preserved — sections render in this order. Values in the data that
+/// are NOT listed here go into a catch-all section at the bottom (the widget
+/// appends them after the ordered keys).
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling.
+List<GroupLabelEntry> parseGroupLabels(String raw) {
+  if (raw.trim().isEmpty) return const [];
+  final List<GroupLabelEntry> out = [];
+  for (final part in raw.split('\u{2605}')) {
+    // ★ separates entries
+    final String trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final int sep = trimmed.indexOf('\u{25FC}'); // first ◼
+    if (sep < 0) {
+      // no ◼ — value doubles as label
+      out.add(GroupLabelEntry(trimmed, trimmed));
+      continue;
+    }
+    final String value = trimmed.substring(0, sep).trim();
+    final String label = trimmed.substring(sep + 1).trim();
+    if (value.isEmpty) continue;
+    out.add(GroupLabelEntry(value, label.isEmpty ? value : label));
+  }
+  return out;
+}
+
+/// Parse `groupRoutes`: `value◼route★value2◼route2`.
+///
+/// Returns a map from group value to route string. Entries without `◼` are
+/// **skipped** (fail-closed: malformed entry = read-only group, not a
+/// fallback to the global route). Empty values before `◼` are skipped.
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling.
+Map<String, String> parseGroupRoutes(String raw) {
+  if (raw.trim().isEmpty) return const {};
+  final Map<String, String> out = {};
+  for (final part in raw.split('\u{2605}')) {
+    // ★ separates entries
+    final String trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final int sep = trimmed.indexOf('\u{25FC}'); // first ◼
+    if (sep < 0) continue; // ponytail: no ◼ — skip (fail-closed, interview #2)
+    final String value = trimmed.substring(0, sep).trim();
+    final String route = trimmed.substring(sep + 1).trim();
+    if (value.isEmpty) continue;
+    out[value] = route;
+  }
+  return out;
+}
+
+/// Effective route for one group section.
+///
+/// - `null`  -> no `groupRoutes` configured; caller falls back to the global
+///              `route` (spec §3: groupBy filled + groupRoutes empty = all
+///              groups use `route`).
+/// - `''`    -> group is not in the map -> read-only (no tap, no ripple).
+/// - other   -> that group's own route.
+String? resolveGroupRoute(Map<String, String> groupRoutes, String groupKey) =>
+    groupRoutes.isEmpty ? null : (groupRoutes[groupKey] ?? '');
+
+/// Parse `stats`: `Label◼filter★Label2◼filter2`.
+///
+/// **Split each box at the FIRST ◼ only** — the filter itself may contain ◼
+/// as part of the gate DSL field/value separator (e.g. `On Job◼ast◼present`
+/// → label `"On Job"`, filter `"ast◼present"`).
+///
+/// Empty filter after ◼ (e.g. `Total◼`) = count all rows.
+/// No ◼ at all (e.g. `Total`) = label only, empty filter.
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling.
+List<StatsDef> parseStatsDefs(String raw) {
+  if (raw.trim().isEmpty) return const [];
+  final List<StatsDef> out = [];
+  for (final part in raw.split('\u{2605}')) {
+    // ★ separates boxes
+    final String trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final int sep = trimmed.indexOf('\u{25FC}'); // FIRST ◼ only
+    if (sep < 0) {
+      // no ◼ — label only, count all
+      out.add(StatsDef(trimmed, ''));
+      continue;
+    }
+    final String label = trimmed.substring(0, sep).trim();
+    final String filter = trimmed.substring(sep + 1).trim();
+    if (label.isEmpty) continue;
+    out.add(StatsDef(label, filter));
+  }
+  return out;
+}
+
+/// Compute stats counts. For each [StatsDef]:
+///   - empty filter → count all docs.
+///   - non-empty filter → count docs matching the filter via [evaluateGate].
+///
+/// Stats filters are literal DSL (no `{token}` resolution needed — spec §5
+/// examples are all literal field◼value).
+List<int> computeStatsCounts(
+  List<StatsDef> defs,
+  List<Map<String, dynamic>> docs,
+) {
+  return defs.map((d) {
+    if (d.filter.isEmpty) return docs.length;
+    return docs.where((doc) => evaluateGate(doc, d.filter)).length;
+  }).toList();
+}
+
+/// Lookup a badge entry by [value]. Returns null if not found or value empty.
+BadgeEntry? lookupBadge(List<BadgeEntry> entries, String value) {
+  final String v = value.trim();
+  if (v.isEmpty || entries.isEmpty) return null;
+  for (final e in entries) {
+    if (e.value == v) return e;
+  }
+  return null;
+}
+
+/// Parsed row definition from the `rows` config field.
+class RowDef {
+  final String label;
+  final String template; // <field> template string
+  const RowDef(this.label, this.template);
+}
+
+/// Parse `rows`: `Label◼template★Label2◼template2★…`.
+///
+/// **Split each row at the FIRST ◼ only** — the template itself may contain ◼
+/// (e.g. `Jam kerja◼<st>–<et>` → label `"Jam kerja"`, template `"<st>–<et>"`).
+///
+/// **No ◼ at all = the whole entry is the TEMPLATE, with an EMPTY label** (D3).
+/// `<ck1>` -> label `""`, template `"<ck1>"`. The renderer then splits the
+/// RESOLVED value at the last `" | "` (see [splitPipeValue]) to get the row's
+/// title. A literal bare entry (`Ringkasan`) therefore renders as a plain value
+/// row, not as a label — deliberate, and invisible under hideEmptyRows:TRUE.
+///
+/// An entry that HAS a ◼ but an empty label (`◼<vn>`) is still SKIPPED.
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling.
+List<RowDef> parseRowDefs(String raw) {
+  if (raw.trim().isEmpty) return const [];
+  final List<RowDef> out = [];
+  for (final part in raw.split('\u{2605}')) {
+    // ★ separates rows
+    final String trimmed = part.trim();
+    if (trimmed.isEmpty) continue;
+    final int sep = trimmed.indexOf('\u{25FC}'); // FIRST ◼ only
+    if (sep < 0) {
+      // no ◼ — empty label, the whole entry is the template (D3)
+      out.add(RowDef('', trimmed));
+      continue;
+    }
+    final String label = trimmed.substring(0, sep).trim();
+    final String template = trimmed.substring(sep + 1).trim();
+    if (label.isEmpty) continue;
+    out.add(RowDef(label, template));
+  }
+  return out;
+}
+
+// ─── Photo label blocks (DETAIL_CARD Perubahan 2) ───────────────────────
+
+/// One photo group: a header label plus the ordered `<field>` TEMPLATES whose
+/// resolved urls render as ONE horizontally scrollable strip under it.
+///
+/// [templates] is growable — [buildImageBlocks] merges into it.
+class ImageBlock {
+  final String label;
+  final List<String> templates;
+  ImageBlock(this.label, this.templates);
+}
+
+/// Append one config group's template<->label PAIRS to [outTpls]/[outLabels].
+///
+/// The pair is the unit: a pair whose template is blank is dropped WHOLE, so a
+/// filtered-out template can never shift the labels of the ones after it.
+/// Every label index is length-guarded (short label list -> `''`) — a label
+/// list SHORTER than the template list therefore opens a new, unlabelled block
+/// at the first unlabelled template. That is intended.
+///
+/// The two try/catch guards are belt-and-braces, mirroring today's shape in
+/// `detail_card.dart`: `diamondTextToList` already catches its own `jsonDecode`
+/// failure and falls back to `input.split('◆')`, so it cannot throw. Kept for
+/// symmetry — their removal is not a required cleanup.
+void _appendImageGroup(
+  String imagesCfg,
+  String labelsCfg,
+  List<String> outTpls,
+  List<String> outLabels,
+) {
+  List<String> rawTpls;
+  List<String> rawLabels;
+  try {
+    rawTpls = diamondTextToList(imagesCfg);
+  } catch (_) {
+    rawTpls = const <String>[];
+  }
+  try {
+    rawLabels = diamondTextToList(labelsCfg);
+  } catch (_) {
+    rawLabels = const <String>[];
+  }
+  for (int i = 0; i < rawTpls.length; i++) {
+    final String t = rawTpls[i].trim();
+    // '' -> diamondTextToList gives [''], NOT []. Dropping the PAIR here is
+    // what keeps an empty `images2` from becoming a phantom block.
+    if (t.isEmpty) continue;
+    outTpls.add(t);
+    outLabels.add(rawLabels.length > i ? rawLabels[i].trim() : '');
+  }
+}
+
+/// Merge `images`/`imageLabels` and the OPTIONAL `images2`/`imageLabels2` into
+/// ordered label blocks (D1).
+///
+/// Group 1 first, then group 2. Consecutive templates carrying the SAME label
+/// — including several consecutive EMPTY labels — merge into ONE block, which
+/// the renderer draws as one header line (omitted when the label is empty) plus
+/// one horizontal strip. `images2` empty/absent therefore degrades to exactly
+/// one block, which is why the ~5 pre-existing detailCard pages need no config
+/// change.
+///
+/// All four arguments MUST be `autheniumDecode`d by the caller (use `_cfg()`).
+/// `'--'` (the sheet's empty sentinel) yields no blocks — `diamondTextToList`
+/// maps it to `[]`.
+List<ImageBlock> buildImageBlocks(
+  String imagesCfg,
+  String labelsCfg,
+  String images2Cfg,
+  String labels2Cfg,
+) {
+  final List<String> tpls = <String>[];
+  final List<String> labels = <String>[];
+  _appendImageGroup(imagesCfg, labelsCfg, tpls, labels);
+  _appendImageGroup(images2Cfg, labels2Cfg, tpls, labels);
+
+  final List<ImageBlock> out = <ImageBlock>[];
+  for (int i = 0; i < tpls.length; i++) {
+    // [tpls] and [labels] are parallel, kept in lockstep by _appendImageGroup.
+    // Guard the read anyway: that invariant lives in the OTHER function, so a
+    // label-side filter added there would turn this into a RangeError thrown
+    // from initState on whichever tenant sheet happens to be short.
+    final String lbl = labels.length > i ? labels[i] : '';
+    if (out.isNotEmpty && out.last.label == lbl) {
+      out.last.templates.add(tpls[i]);
+    } else {
+      out.add(ImageBlock(lbl, <String>[tpls[i]]));
+    }
+  }
+  return out;
+}
+
+// ─── Label-less row value split (DETAIL_CARD Perubahan 3) ───────────────
+
+/// Separator inside a label-less row's RESOLVED value: SPACE pipe SPACE.
+///
+/// WIRE FORMAT, TWO ENDS, NO SPANNING TEST. The writer is `checklistSerialize`
+/// in `lib/widget/checklist_dynamic.dart`, which emits
+/// `'${checklistTitleKey(title)} $checklistPairSep ${checklistTitleKey(label)}'`
+/// with `const String checklistPairSep = '|'`. That constant and this one are
+/// the two halves of one contract: the writer's tests assert the serialized
+/// string, this side's tests assert the split, and BOTH stay green if either
+/// side changes its spacing. Change one, change the other.
+///
+/// `|` is NOT in `forbiddenCharacter`, so it survives `stringCleanUp` into the
+/// stored doc field verbatim. An UNSPACED `|` is a literal character, not a
+/// separator.
+const String pipeRowSep = ' | ';
+
+/// A label-less row's resolved value, split into a title and a value.
+class PipeSplit {
+  final String title;
+  final String value;
+  const PipeSplit(this.title, this.value);
+}
+
+/// Split a RESOLVED label-less row value at the **LAST** [pipeRowSep] (D4).
+///
+/// Last, not first, so a title that itself contains ` | ` stays intact and the
+/// trailing status is what gets separated. Both sides are trimmed. No
+/// separator -> empty title + the trimmed value (the row renders plain).
+PipeSplit splitPipeValue(String resolved) {
+  final int i = resolved.lastIndexOf(pipeRowSep);
+  if (i < 0) return PipeSplit('', resolved.trim());
+  return PipeSplit(
+    resolved.substring(0, i).trim(),
+    resolved.substring(i + pipeRowSep.length).trim(),
+  );
+}
+
+// ─── Slot gate helpers (approve-leave-gating-and-note) ──────────────────
+
+/// Parsed `gateSlot` config: `slotField◆pointerField◆levelField`.
+class GateSlotConfig {
+  final String slotField;
+  final String pointerField;
+  final String levelField;
+  const GateSlotConfig(this.slotField, this.pointerField, this.levelField);
+
+  /// True when gating is effectively OFF (incomplete config).
+  /// Both pointerField AND levelField must be empty to disable — having only
+  /// one of the two is still a valid (concrete-only or wildcard-only) config.
+  bool get isEmpty =>
+      slotField.isEmpty || (pointerField.isEmpty && levelField.isEmpty);
+}
+
+/// Parsed slot terms from a grant doc's slot field value.
+class SlotTerms {
+  final Set<String> concrete;
+  final Set<String> wildcardLevels;
+  const SlotTerms(this.concrete, this.wildcardLevels);
+}
+
+/// Parse `gateSlot` config: `slotField◆pointerField◆levelField`.
+///
+/// Caller MUST `autheniumDecode` the raw string BEFORE calling (use `_cfg()`).
+/// Length-guarded: short arrays → empty string defaults.
+GateSlotConfig parseGateSlot(String decoded) {
+  if (decoded.trim().isEmpty) return const GateSlotConfig('', '', '');
+  final List<String> segs = decoded.split('\u{25C6}'); // ◆
+  return GateSlotConfig(
+    segs.isNotEmpty ? segs[0].trim() : '',
+    segs.length > 1 ? segs[1].trim() : '',
+    segs.length > 2 ? segs[2].trim() : '',
+  );
+}
+
+/// Parse slot terms from a grant doc's raw slot field value.
+///
+/// Split on `|`, trim each term, drop empties.
+/// Term starting with `*-` (length > 2) → wildcard: level = substring after
+/// `*-`, added to [wildcardLevels].
+/// Every other term → concrete (compared verbatim against pointerField).
+///
+/// Assumption: only `*-{lvl}` is a wildcard form; `{cc}-*` and `*-*` are NOT
+/// wildcards — treated as concrete (they simply will not match anything).
+SlotTerms parseSlotTerms(String rawSlotValue) {
+  final Set<String> concrete = {};
+  final Set<String> wildcardLevels = {};
+  for (final term in rawSlotValue.split('|')) {
+    final String t = term.trim();
+    if (t.isEmpty) continue;
+    if (t.startsWith('*-') && t.length > 2) {
+      wildcardLevels.add(t.substring(2).trim());
+    } else {
+      concrete.add(t);
+    }
+  }
+  return SlotTerms(concrete, wildcardLevels);
+}
+
+/// Filter docs by slot gate.
+///
+/// A doc is visible iff:
+///   `row[pointerField].toString().trim()` is in [concrete]
+///   OR `row[levelField].toString().trim()` is in [wildcardLevels].
+///
+/// Type tolerance: all comparisons via `.toString().trim()` (D8).
+/// No self-approve exclusion (D11): gating is purely slot-based.
+///
+/// Returns empty list when both sets are empty (no valid slots → no visible
+/// docs).
+List<Map<String, dynamic>> filterBySlotGate(
+  List<Map<String, dynamic>> docs,
+  Set<String> concrete,
+  Set<String> wildcardLevels,
+  String pointerField,
+  String levelField,
+) {
+  // ponytail: growable (NOT const []) — callers .sort() this result
+  if (concrete.isEmpty && wildcardLevels.isEmpty) {
+    return <Map<String, dynamic>>[];
+  }
+  return docs.where((doc) {
+    final String pointer = (doc[pointerField] ?? '').toString().trim();
+    final String level = (doc[levelField] ?? '').toString().trim();
+    return isVisibleBySlotGate(pointer, level, concrete, wildcardLevels);
+  }).toList();
+}
+
+/// Single-value slot gate predicate.
+///
+/// Used by the detail-page choke point (StickyBarRenderer._buildApproval)
+/// where the pointer and level arrive as scalar values resolved from the
+/// displayed row, not as keyed map fields.
+///
+/// Also called by [filterBySlotGate] so the visibility rule has ONE definition.
+///
+/// Returns false when both sets are empty (fail-closed: no valid slots = not
+/// visible). Empty pointer/level = not visible (covers direct navigation and
+/// pre-publish state).
+bool isVisibleBySlotGate(
+  String pointerValue,
+  String levelValue,
+  Set<String> concrete,
+  Set<String> wildcardLevels,
+) {
+  if (concrete.isEmpty && wildcardLevels.isEmpty) return false;
+  if (concrete.contains(pointerValue)) return true;
+  return wildcardLevels.contains(levelValue);
+}
+
+// ─── `limit` — top-N cut (list-card-limit) ──────────────────────────────
+
+/// Parse the optional `limit` config key into a row cap.
+///
+/// The spec writes `"limit":5` (a plain number, like `delay`/`size`), but
+/// sheet-sourced JSON is inconsistent, so a quoted `"5"` and a `jsonDecode`
+/// double (`5.0`) are accepted too. Everything that is not a positive whole
+/// number means UNLIMITED and maps to `0`: absent (`null`), `''`, `'--'` (the
+/// sheet's empty-cell sentinel), `0`, a negative, a bool, or unparseable text.
+/// `0` is the single "no cap" sentinel, so callers only ever test `> 0`.
+///
+/// A NEGATIVE must land on 0 and not reach [applyLimit]: `Iterable.take` with a
+/// negative count throws `RangeError`, i.e. one bad sheet cell would crash that
+/// tenant's screen.
+///
+/// A quoted `'5.0'` yields 0 (unlimited) — `int.tryParse` rejects it and spec
+/// §1 says unparseable = no cap. Documented in `docs/widgets/list_card.md` and
+/// asserted in `test/list_card_limit_test.dart`; change both together.
+///
+/// NOT `autheniumDecode`d: this is a number, not a ◼/⭘-encoded string, so the
+/// caller reads `component['limit']` raw and never through `_cfg()`.
+///
+/// Ladder shape mirrors the repo's private `dynamic → int` coercers
+/// (`admin_home_support.dart` `_toInt`, `asset_stock_list.dart` `_safeInt`),
+/// plus the `limit`-specific "≤ 0 means unlimited" rule.
+int parseLimit(dynamic raw) {
+  final int n;
+  if (raw == null) {
+    n = 0;
+  } else if (raw is int) {
+    n = raw;
+  } else if (raw is num) {
+    n = raw.toInt(); // jsonDecode may hand back 5.0
+  } else {
+    n = int.tryParse(raw.toString().trim()) ?? 0;
+  }
+  return n > 0 ? n : 0;
+}
+
+/// Cut a display list down to its first [limit] rows.
+///
+/// `limit <= 0` (unlimited) and `limit >= docs.length` both return the SAME
+/// list instance — every already-deployed LIST_CARD has no `limit` key, so the
+/// no-cap path allocates nothing and behaves identically to before.
+///
+/// Applied to the DISPLAY list only: after the sort in `_getServerFiltered()`
+/// and after the search bar, but BEFORE grouping. Two consequences, both
+/// deliberate:
+///   * grouped mode gets a GLOBAL cap (N rows in total across all sections,
+///     never N per section) and a group with no rows inside the cap is not
+///     rendered at all;
+///   * the header count and the stats strip read `serverFiltered`, which is
+///     never cut, so they keep reporting the original total.
+///
+/// [docs] is already `List<Map<String, dynamic>>`, so `.take().toList()` stays
+/// statically typed — this is not the `dynamic`-source `.map().toList()` trap.
+List<Map<String, dynamic>> applyLimit(
+  List<Map<String, dynamic>> docs,
+  int limit,
+) {
+  if (limit <= 0 || limit >= docs.length) return docs;
+  return docs.take(limit).toList();
+}
