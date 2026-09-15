@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="fastlane.lanes">
+    
+    
+    
+      
+      <testcase classname="fastlane.lanes" name="0: default_platform" time="0.000214">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="1: security unlock-keychain -p &apos;&apos; ~/Library/Keychains/login.keychain-db 2&gt;/dev/null || security unlock-keychain -p &apos;&apos; ~/Library/Keychains/login.keychain 2&gt;/dev/null || true" time="0.059793">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="2: xattr -cr .. 2&gt;/dev/null || true" time="1.793793">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="3: app_store_connect_api_key" time="0.003436">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="4: get_certificates" time="2.109246">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="5: get_provisioning_profile" time="1.651503">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="6: unset GEM_HOME GEM_PATH RUBYLIB; cd .. &amp;&amp; flutter build ipa --release || true" time="448.475633">
+        
+      </testcase>
+    
+      
+      <testcase classname="fastlane.lanes" name="7: upload_to_testflight" time="155.459494">
+        
+      </testcase>
+    
+  </testsuite>
+</testsuites>

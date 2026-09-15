@@ -1,0 +1,1636 @@
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+
+// Prefixed: `Signature` collides with pointycastle's own Signature class.
+import 'package:cryptography/cryptography.dart' as ed;
+import 'package:flutter/cupertino.dart';
+import 'package:pointycastle/export.dart'; // Replaced 'argon2' with 'pointycastle'
+
+// import 'package:argon2_ffi_base/argon2_ffi_base.dart';
+// full registry
+// import 'package:flutter_sodium/flutter_sodium.dart';
+// Import cycle, deliberate: authenium_keys imports this file back for
+// `Scheme3Keyring` and `scheme3ParseKey`. Dart resolves it; breaking it would
+// mean moving the keyring TYPES out of the crypto layer, which costs more than
+// the cycle does. Only `getVidUQR` reaches across, and only for a Scheme 3 token.
+import '../firestore_repository/authenium_keys.dart';
+import '../ftz_secret.dart';
+import '../global.dart';
+// import 'package:encrypt/encrypt.dart' as encrypt; // Removed encrypt package
+
+typedef ClusterPosition = ({String vid, int cluster, int position});
+// test keccak256 & keccak512 in :
+// https://github.com/mmsqe/pointycastle/blob/master/test/digests/sha3_test.dart
+
+/// Creates a checksum based on the SHA3-256 hash of the input data.
+/// The output is a record containing the final integer checksum and the intermediate hash.
+({int checksum, String sha256Hash}) createChecksumSha3(dynamic data) {
+  // 1. Convert the entire data structure to a single, stable string.
+  String stableString = _createStableString(data);
+
+  // 2. Compute the SHA3-256 hash of that string.
+  String hashHex = sha3_256(stableString);
+
+  // 3. Convert the hex hash to a BigInt and use modulo to get a 14-digit integer.
+  final BigInt hashAsBigInt = BigInt.parse(hashHex, radix: 16);
+  final BigInt modulus = BigInt.from(10).pow(14);
+  final int finalChecksum = (hashAsBigInt % modulus).toInt();
+
+  return (checksum: finalChecksum, sha256Hash: hashHex);
+} // end of createChecksumSha3
+
+/// Recursively traverses a data structure to create a single, stable string representation.
+String _createStableString(dynamic element) {
+  if (element == null) return "null";
+  if (element is String)
+    return '"$element"'; // Add quotes to distinguish from other types
+  if (element is num || element is bool) return element.toString();
+
+  if (element is List) {
+    return '[${element.map(_createStableString).join(',')}]';
+  }
+
+  if (element is Map) {
+    // Sort keys to ensure map stability
+    var sortedKeys = element.keys.toList()
+      ..sort(
+        (a, b) => _createStableString(a).compareTo(_createStableString(b)),
+      );
+
+    var mapEntries = sortedKeys.map((key) {
+      return '${_createStableString(key)}:${_createStableString(element[key])}';
+    });
+    return '{${mapEntries.join(',')}}';
+  }
+
+  // Fallback for other types
+  return '"${element.toString()}"';
+} // end of createChecksumSha3
+
+Future<String> getSharedKey(int prefix) async {
+  // get shared key for user qr
+  if (prefix == 1) {
+    List<String?> r = await Future.wait([
+      storage.read(key: 'sd1'),
+      storage.read(key: 'sd2'),
+    ]);
+    if (r[0] == null || r[0]!.length < 7) {
+      r[0] = '11111111111111';
+    }
+    if (r[1] == null || r[0]!.length < 7) {
+      r[1] = '22222222222';
+    }
+    return sha3_256(
+      r[0]!.substring(5) +
+          r[1]!.substring(0, r[1]!.length - 1).split('').reversed.join(''),
+    );
+  } else {
+    return emptyString;
+  } // end if (prefix == 1)
+} // end of getSharedKey
+
+String generateArgon2Salt() {
+  final random = Random.secure();
+  return base64Encode(List<int>.generate(16, (i) => random.nextInt(256)));
+} // end of generateArgon2Salt
+
+String passwordHashCreate(String password) {
+  String hashResult = emptyString;
+  int vid = transactionStore.state.screenTx['#VID'] ?? -1;
+  if (vid < 0) {
+    return '${hashResult}VID not set';
+  }
+  try {
+    String saltSeed = base64ForUrl(generateArgon2Salt());
+    Uint8List salt = latin1.encode(
+      sha3_256('hjJ$saltSeed${vid}s wA${String.fromCharCode(10)}23+=%'),
+    );
+    Argon2Parameters parameters = Argon2Parameters(
+      Argon2Parameters.ARGON2_id,
+      salt,
+      version: Argon2Parameters.ARGON2_VERSION_13,
+      iterations: 4,
+      memory: 1 << 16, // Renamed from memoryKB, value 65536
+      lanes: 2,
+      desiredKeyLength: 64, // Added required parameter
+    );
+    final argon2 = KeyDerivator("Argon2"); // Use KeyDerivator factory
+    argon2.init(parameters);
+    Uint8List passwordBytes = utf8.encode(
+      password,
+    ); // Changed from parameters.converter
+    Uint8List result = argon2.process(passwordBytes); // Use process()
+    String hash64 = base64ForUrl(base64Encode(result));
+    hashResult = '$saltSeed:$hash64'; // Concatenate salt and hash
+  } catch (eh) {
+    hashResult = emptyString + eh.toString();
+  }
+  return hashResult;
+} // end of passwordHashCreate
+
+bool passwordVerify(String password, String passwordHash) {
+  //  var uid = transactionStore.state.screenTx['#FIREBASE_USER'].uid;
+  bool boolResult = false;
+  final parts = passwordHash.split(':');
+  if (parts.length != 2) {
+    // throw Exception('Invalid hashed password format');
+    return false;
+  }
+  int vid = transactionStore.state.screenTx['#VID'] ?? -1;
+  if (vid < 0) {
+    // throw Exception('VID not set');
+    return false;
+  }
+  try {
+    String saltSeed = parts[0];
+    Uint8List salt = latin1.encode(
+      sha3_256('hjJ$saltSeed${vid}s wA${String.fromCharCode(10)}23+=%'),
+    ); // Fixed typo: sha3_2s.sha3_256 -> sha3_256
+    Argon2Parameters parameters = Argon2Parameters(
+      Argon2Parameters.ARGON2_id,
+      salt,
+      version: Argon2Parameters.ARGON2_VERSION_13,
+      iterations: 4,
+      memory: 1 << 16, // Renamed from memoryKB, value 65536
+      lanes: 2,
+      desiredKeyLength: 64, // Added required parameter
+    );
+    final argon2 = KeyDerivator("Argon2"); // Use KeyDerivator factory
+    argon2.init(parameters);
+    Uint8List passwordBytes = utf8.encode(
+      password,
+    ); // Changed from parameters.converter
+    Uint8List result = argon2.process(passwordBytes); // Use process()
+    String currentHash = base64ForUrl(base64Encode(result));
+    boolResult = constantTimeComparison(currentHash, parts[1]);
+  } catch (ve) {
+    boolResult = false;
+  }
+  return boolResult;
+} // end of argon2VerifyPassword
+
+bool constantTimeComparison(String a, String b) {
+  // Helper function for constant-time comparison to avoid timing attacks
+  if (a.length != b.length) {
+    return false;
+  }
+  var result = 0;
+  for (int i = 0; i < a.length; i++) {
+    result |= a.codeUnitAt(i) ^ b.codeUnitAt(i);
+  }
+  return result == 0;
+} // end of constantTimeComparison
+
+String crQRAttend1Enc(String content) {
+  // attend1 encryption
+  // put get key and iv here
+  return aesEnc(content, 'tempkey', 'tempiv');
+}
+
+String crQRAttend1Dec(String content) {
+  // attend1 decryption
+  // put get key and iv here
+  // return aesDec(content, 'tempkey', 'tempiv');
+  return content;
+}
+
+String aesEnc(var data, var key, var iv) {
+  // put AES encrypt algorithm here
+  return data;
+}
+
+/// Helper function to convert a hex string to a Uint8List
+Uint8List _hexToBytes(String hex) {
+  if (hex.length % 2 != 0) {
+    throw ArgumentError("Hex string must have an even length.");
+  }
+  final bytes = Uint8List(hex.length ~/ 2);
+  for (int i = 0; i < bytes.length; i++) {
+    final hexChars = hex.substring(i * 2, (i * 2) + 2);
+    bytes[i] = int.parse(hexChars, radix: 16);
+  }
+  return bytes;
+}
+
+/// Decrypts a hex-encoded string using AES-256.
+/// The IV is extracted from the first 16 bytes (32 hex chars) of the payload.
+/// Variant can be 'cbc' or 'gcm'.
+/// [hexPayload] The hex-encoded string containing IV + ciphertext.
+/// [hexKeyString] The 64-character hex-encoded (32-byte) secret key.
+/// Returns the decrypted plaintext.
+String aesDec(String hexPayload, String hexKeyString, String variant) {
+  String decrypted = errorString;
+  // The IV is 16 bytes, which is 32 characters in hexadecimal.
+  try {
+    const int ivSize = 32;
+    if (hexPayload.length < ivSize) {
+      throw ArgumentError("Hex payload is too short to contain an IV.");
+    }
+
+    // 1. Extract IV and ciphertext from the hex payload
+    final String ivHex = hexPayload.substring(0, ivSize);
+    final String ciphertextHex = hexPayload.substring(ivSize);
+
+    // 2. Convert hex strings to bytes using our helper
+    final keyBytes = _hexToBytes(hexKeyString);
+    final ivBytes = _hexToBytes(ivHex);
+    final ciphertextBytes = _hexToBytes(ciphertextHex);
+
+    // 3. Create KeyParameter
+    final keyParams = KeyParameter(keyBytes);
+
+    Uint8List decryptedBytes;
+
+    // 4. Create the encrypter and decrypt
+    if (variant == 'cbc') {
+      // Create a CBC cipher with PKCS7 padding (standard for 'encrypt' pkg)
+      final cipher = PaddedBlockCipher('AES/CBC/PKCS7');
+
+      // Initialize for decryption
+      cipher.init(
+        false, // 'false' for decryption
+        PaddedBlockCipherParameters(
+          ParametersWithIV(keyParams, ivBytes),
+          null, // No specific padding params
+        ),
+      );
+
+      // Process the data
+      decryptedBytes = cipher.process(ciphertextBytes);
+    } else if (variant == 'gcm') {
+      // Create a GCM cipher
+      final cipher = GCMBlockCipher(AESEngine());
+
+      // Initialize for decryption
+      // GCM default MAC size is 128 bits (16 bytes)
+      // The 'encrypt' package uses 128-bit MAC by default.
+      final macSizeInBits = 128;
+      final params = AEADParameters(
+        keyParams,
+        macSizeInBits,
+        ivBytes,
+        Uint8List(0),
+      );
+      cipher.init(false, params); // 'false' for decryption
+
+      // Allocate an output buffer.
+      // getOutputSize for decryption will return input_length - mac_size.
+      final outputSize = cipher.getOutputSize(ciphertextBytes.length);
+      if (outputSize < 0) {
+        throw ArgumentError("Input is too short to contain a GCM MAC tag.");
+      }
+      final outputBuffer = Uint8List(outputSize);
+
+      // Process all bytes (ciphertext + tag) in one go.
+      // pointycastle's GCM implementation handles splitting them.
+      int bytesProcessed = cipher.processBytes(
+        ciphertextBytes,
+        0,
+        ciphertextBytes.length,
+        outputBuffer,
+        0,
+      );
+
+      // doFinal will validate the tag (from the end of ciphertextBytes)
+      // and write any remaining buffered bytes.
+      // It will throw an exception if the tag is invalid.
+      int bytesFinal = cipher.doFinal(outputBuffer, bytesProcessed);
+
+      // The final decrypted data is in the output buffer.
+      int totalBytes = bytesProcessed + bytesFinal;
+      decryptedBytes = outputBuffer.sublist(0, totalBytes);
+    } else {
+      throw ArgumentError("Unsupported AES variant: $variant");
+    }
+
+    // 5. Convert decrypted bytes back to a string
+    decrypted = utf8.decode(decryptedBytes);
+  } catch (e) {
+    debugPrint("aesDec failed: $e");
+    decrypted = errorString; // Return the initial value if decryption fails
+  }
+  return decrypted;
+} // end aesDec
+
+Future pinHash(String pin) async {
+  var result = passwordHashCreate(pin);
+  return result;
+}
+
+// String sha3_512(String inputText) {
+//   var plainText = createUInt8ListFromString(inputText);
+//   var out = sha3_512Registry.process(plainText);
+//   String outputText = formatBytesAsHexString(out);
+//   return outputText;
+// }
+
+String sha3_256(String inputText) {
+  dynamic plainText = createUInt8ListFromString(inputText);
+  dynamic out = sha3_256Registry.process(plainText);
+  return formatBytesAsHexString(out);
+} // end of sha3_256
+
+String sha3_256B64(String inputText) {
+  dynamic plainText = createUInt8ListFromString(inputText);
+  dynamic out = sha3_256Registry.process(plainText);
+  return base64Encode(out);
+} // end of sha3_256B64Url
+
+Uint8List createUInt8ListFromString(String s) {
+  var ret = Uint8List(s.length);
+  for (var i = 0; i < s.length; i++) {
+    ret[i] = s.codeUnitAt(i);
+  }
+  return ret;
+} // end of createUInt8ListFromString
+
+String formatBytesAsHexString(Uint8List bytes) {
+  var result = StringBuffer();
+  for (var i = 0; i < bytes.lengthInBytes; i++) {
+    var part = bytes[i];
+    result.write('${part < 16 ? '0' : ''}${part.toRadixString(16)}');
+  }
+  return result.toString();
+} // end of formatBytesAsHexString
+
+String base64ForUrl(String base64String) {
+  // Replace any invalid characters for a URL
+  final String result = base64String
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replaceAll('=', '');
+  return result;
+} // end of base64ForUrl
+
+String createPublicDH1(String s, p, g) {
+  var result = StringBuffer();
+  for (var i = 0; i < s.length; i++) {
+    int d1 = int.parse(s.substring(i, i + 1), radix: 16);
+    int d2 = (pow(dhG, (d1 % dhP)) % dhP).toInt();
+    String d3 = d2.toRadixString(16);
+    result.write(d3);
+  }
+  return result.toString();
+} // end of createPublicDH1
+
+String createPrivateKey(String saltInput) {
+  /// create private key from vid, time, location, imei, and any salt
+  /// assumption state [IMEI, LOCATION, VID] set already by other process
+  String result = '--';
+  String salt = saltInput;
+  int now = DateTime.now().millisecondsSinceEpoch;
+  var state = transactionStore.state.screenTx;
+  //  String seed =
+  //      salt + state['#VID'] + now.toString() + state['#LOCATION'].lng.toString();
+  //  seed += state['#IMEI'] + state['#LOCATION'].lat.toString();
+  return result;
+} // end of createPrivateKey
+
+String qr1Decrypt(String cipherText) {
+  String result = 'Fail';
+  result = cipherText;
+  return result;
+} // end of qr1Decrypt
+
+String makeLqrCode(String text) {
+  /// Build a version-0 (plaintext) location QR payload from any text.
+  /// Format: '0' encryption-version marker + 'l' location tag + sha1 hex,
+  /// e.g. 0l9d637068c9470c72407715b3dc03a110e818b75b (1 + 1 + 40 = 42 chars).
+  /// Deterministic — the same text always yields the same code.
+  /// The result is what lqrVerify returns minus the leading '0', so it must
+  /// match a key in #LQR_LIST (or #TABLE<code>) for a scan to resolve.
+  // ponytail: sha1 only supplies a stable 160-bit id. aecDecrypt version '0'
+  // does no verification, so this is an identifier, not a security boundary.
+  // Swap for the real sheet generator once its algorithm is known.
+  final Uint8List digest = SHA1Digest().process(
+    Uint8List.fromList(utf8.encode(text)),
+  );
+  return '0l${formatBytesAsHexString(digest)}';
+} // end of makeLqrCode
+
+Future<String> lqrVerify(String p, String q, var rawQrText) async {
+  // Scheme 3 point badges verify themselves; dispatch on the FORMAT, ahead of
+  // the `/qr/` cut below. Left alone, a Scheme 3 location URL is cut at the
+  // LAST `/` -- and a Base45 body carries `/` -- so the token is sliced
+  // mid-string, aecDecrypt finds no `case '3'` (it has only '0' and '2'), and
+  // the whole thing falls out as errorString: "tidak dikenal", no log.
+  //
+  // Here rather than in a wrapper, for the same reason as getVidUQR: the four
+  // callers already write `lqrVerify(...)`, and a wrapper only works for the
+  // ones someone remembers to change. `getQRContent` qrType 'L' -- the path
+  // otq_txf_2 and otq_txf take -- is the one that matters most.
+  if (scheme3Token(rawQrText.toString()).isNotEmpty) {
+    final String code = await scheme3LqrCode(
+      rawQrText.toString(),
+      await autheniumKeys(),
+    );
+    return code.isEmpty ? errorString : code;
+  }
+
+  String qrValid = empty;
+  String qrText = rawQrText;
+  String returnValue = errorString;
+
+  if (rawQrText.length >= 4 && rawQrText.substring(0, 4) == 'http') {
+    qrText = rawQrText.substring(rawQrText.lastIndexOf('/qr/') + 4);
+  }
+  // qrValid = location[qrText]??empty;
+  if (qrText.isNotEmpty) {
+    qrValid = aecDecrypt(qrText, 'l');
+  }
+  if (qrValid != empty) {
+    returnValue = qrValid;
+  } else {
+    returnValue = errorString;
+  }
+  // use code below as reference to version 1 decryption (220105)
+  /*
+  if (qrValid == empty) {
+    if (qrText.substring(0, 1) == '1' &&
+        qrText.length == 129) { // 129 = fix length of location QR code
+      String shared = aec1S(p, q);
+      String decrypted = aec1D(shared, qrText);
+      String qrData = decrypted.substring(0, 40);
+      String qrHash = decrypted.substring(40);
+      if (qrHash == aec1h(qrData)) {
+        qrValid = qrData;
+      }
+    }
+  }
+  */
+  return returnValue;
+} // end of lqrVerify
+
+/// Calculates a value based on a complex formula, mimicking a Google Sheets function.
+///
+/// The formula is equivalent to:
+/// =MOD(((VALUE(MID(A2, 1, 7))+VALUE(MID(A2, 2, 7))+VALUE(MID(A2, 3, 7))+VALUE(MID(A2, 4, 7)))*100000+VALUE(MID(A2, 5, 4))+VALUE(MID(A2, 7, 4))*VALUE(MID(A2, 9, 4))), 1000000000000)
+///
+/// @param input The input string, corresponding to cell A2.
+/// @returns The calculated integer result.
+int getAddress(String input) {
+  // Ensure the input string is long enough to prevent range errors.
+  if (input.length < 14) {
+    throw ArgumentError(
+      "Input string must be at least 14 characters long. Current length: ${input.length}",
+    );
+  }
+
+  try {
+    // Helper function to parse substrings into integers, mimicking VALUE(MID(...)).
+    // Dart's substring is 0-indexed, so we subtract 1 from the start position.
+    int getValue(int start, int length) {
+      // Adjusted for 0-indexed substring: start - 1
+      return int.parse(input.substring(start - 1, (start - 1) + length));
+    }
+
+    // Part 1: Sum of the first four 7-digit numbers.
+    int sumOfFirstParts =
+        getValue(1, 7) + getValue(2, 7) + getValue(3, 7) + getValue(4, 7);
+
+    // Part 2: Multiply the sum by 100,000.
+    int multipliedSum = sumOfFirstParts * 100000;
+
+    // Part 3: The 4-digit number starting at the 5th position.
+    int middlePart = getValue(5, 4);
+
+    // Part 4: The product of two 4-digit numbers.
+    int productOfLastParts = getValue(7, 4) * getValue(9, 4);
+
+    // Part 5: Sum all the calculated parts.
+    int totalSum = multipliedSum + middlePart + productOfLastParts;
+
+    // Part 6: Apply the final modulo.
+    int result = totalSum % 1000000000000;
+
+    return result;
+  } on FormatException catch (e) {
+    // Handle cases where a substring is not a valid number.
+    debugPrint(
+      "Error: A part of the input string could not be parsed as a number. Details: $e",
+    );
+    rethrow;
+  } on RangeError catch (e) {
+    debugPrint(
+      "Error: Index out of range when parsing input string. Please check input length. Details: $e",
+    );
+    rethrow;
+  }
+} // end of getAddress
+
+/// Extracts the cluster and position from a given address.
+///
+/// @param vid The video ID (which is the address string before conversion).
+/// @returns A record containing the cluster (first 7 digits) and position (last 5 digits).
+ClusterPosition getClusterAndPosition(String vid) {
+  String result = errorString;
+  int cluster = -1;
+  int position = -1;
+
+  try {
+    // Calculate the address integer from the video ID string.
+    int address = getAddress(vid);
+
+    // Convert the address integer to a string, padding with leading zeros to ensure it's 12 digits long.
+    String addressString = address.toString().padLeft(12, '0');
+
+    // Ensure the string is at least 12 characters long after padding.
+    if (addressString.length < 12) {
+      throw StateError(
+        'Address string must be at least 12 characters long after padding for cluster/position extraction.',
+      );
+    }
+
+    // The cluster is the integer value of the first 7 digits.
+    cluster = int.parse(addressString.substring(0, 7));
+
+    // The position is the integer value of the remaining 5 digits.
+    position = int.parse(
+      addressString.substring(7, 12),
+    ); // Explicitly take 5 digits
+  } catch (e) {
+    result = errorString;
+  }
+  return (vid: result, cluster: cluster, position: position);
+} // end of getClusterAndPosition
+
+String assetVerify(String rawQrText, int initialCheckPosition) {
+  // The lqrVerify function returns a non-nullable String, so `result` here will not be null.
+  // The type of `result` is changed from `String?` to `String`.
+  String result = errorString;
+  String qrText = rawQrText;
+  try {
+    if (rawQrText.length >= 4 && rawQrText.substring(0, 4) == 'http') {
+      qrText = rawQrText.substring(rawQrText.lastIndexOf('/qr/') + 4);
+    }
+    String? t = getAecKey('6');
+    result = aesDec(qrText, getAecKey('6')!, 'cbc');
+    // The null check `result != null` is now redundant and removed.
+    debugPrint('qrText in assetVerify: $result');
+    bool codeIsValid = integrityCheck(result, initialCheckPosition);
+    if (!codeIsValid) {
+      result = errorString;
+    }
+  } catch (e) {
+    result = errorString;
+  }
+  return result;
+} // end of assetVerify(String p, String q, var rawQrText)
+
+bool integrityCheck(String qrText, int initialCheckPosition) {
+  // todo put integrity check here
+  // based on https://docs.google.com/spreadsheets/d/14qT1qbVitTYYfppF8Y21OGC_5XYUI9Kk0KzZtN15vZo/edit?gid=1066641925#gid=1066641925
+  return true;
+} // end of integrityCheck
+
+// ========================== Temporary ==============================
+String curToken =
+    'pd66RVFnC0LI4b2267227b1521271612Fn0P1223191b173558b12a9134a1264818ca621641298a77141c4524232434969cc1147b72491c273435c74b127514518c918c7361662611c49a628ab8313b1614c2454ba418447ca934128186332114b3998a24714139572b6a44b61cb2267227b152127161271c129c612111221588974117539a4129689b26b994247861232912ec1d6fd216ee79589e7471396e21172fb11affd261d671dd2e50fd2de711705ffa965becb19329ad013ed4dc58314f272d72c3564118f05ead50dedd3881b6ca';
+// ========================== end of Temporary =============================
+// =========================== Key Getter ===========================
+Future omLqrReaderP() async {
+  String? myOmLqrReaderP;
+  try {
+    myOmLqrReaderP = await storage.read(key: 'omLqrReaderP');
+  } catch (e) {
+    devPrint(e.toString());
+  }
+  if (myOmLqrReaderP == null) {
+    myOmLqrReaderP = curToken.substring(356, 420);
+    storage.write(key: 'omLqrReaderP', value: myOmLqrReaderP);
+  }
+  return myOmLqrReaderP;
+} // end of omLqrReaderP
+
+Future osLqrMakerQ() async {
+  String? myOsLqrMakerQ;
+  try {
+    myOsLqrMakerQ = await storage.read(key: 'osLqrMakerQ');
+  } catch (e) {
+    devPrint(e.toString());
+  }
+  if (myOsLqrMakerQ == null) {
+    myOsLqrMakerQ = curToken.substring(36, 164);
+    storage.write(key: 'osLqrMakerQ', value: myOsLqrMakerQ);
+  } // end if (myOsLqrMakerQ == null)
+  return myOsLqrMakerQ;
+} // end of osLqrMakerQ
+
+// ========================= end of Key Getter ===========================
+// ========================== AEC1 family ==========================
+//void main() {
+//  const secureSharedKey1 =
+//      'ff5db751ebdba8970b972ddb8eb20' + '1391cca39cbd13ecafd4f553b20088801f7';
+//  const securePrivateKey1 =
+//      '107efcd749eeca80de61681786' + '6fb6589ace3ffa629364ff907129551fb964f5';
+//
+//  String privateKey =
+//      'e595adbe0c1dc55facc121e133c7f7d2a42886490860eb73045e8b1021900967';
+//  String myPublicKey = aec1q(privateKey);
+//  String otherPublicKey =
+//      '242b24c14c2c51a5c9417a211b5132c769345129b147187c1a713aa1a' +
+//          '44141612115664116143125bb51413923a113911545bba113a94191826c31263b24b33c                                   ';
+//  String sharedKey = aec1s(privateKey, otherPublicKey);
+//  String rawData = '415c4dd108337b1285178e20e6f3d4142f61feba4c' +
+//      '79d74eab1d6480406f5e8e5498d6e2489a7552e9469595e3c6dd30df541b84';
+//
+//  String keyFromPassPhrase = aec1h('This is my very secret passphrase');
+////   devPrint ('key len = ${keyFromPassPhrase.length}');
+//  String chiperPrivateKey = aec1eH64(keyFromPassPhrase, privateKey);
+//  String pb2 = aec1qc(keyFromPassPhrase, chiperPrivateKey);
+//  String shared2 = aec1sc(keyFromPassPhrase, chiperPrivateKey, otherPublicKey);
+//  String encryptedData = aec1e64c(keyFromPassPhrase, chiperPrivateKey, rawData);
+//  String data = aec1d64c(keyFromPassPhrase, chiperPrivateKey, encryptedData);
+//  String teste = aec1eH64(secureSharedKey1,rawData);
+//  String testd = aec1dH64(secureSharedKey1,teste);
+//  String newEncrypted = aec1eH64(secureSharedKey1,rawData);
+//  String newDecrypted = aec1dH64(secureSharedKey1,newEncrypted);
+//  devPrint ('private key $privateKey');
+//  devPrint ('public1 = $myPublicKey');
+//  devPrint ('public2 = $pb2');
+//  devPrint ('shared key = $sharedKey');
+//  devPrint ('shared2 = $shared2');
+//  devPrint ('key from pass phrase $keyFromPassPhrase');
+//  devPrint ('cp = $chiperPrivateKey');
+//  devPrint ('cp decrypted ${aec1dH64(keyFromPassPhrase,chiperPrivateKey)}');
+//  devPrint('rawData = $rawData');
+//  devPrint ('encrypted = $encryptedData');
+//  devPrint ('decrypted = $data');
+//  devPrint ('test encryption H64 = $teste');
+//  devPrint ('test decryption H64 = $testd');
+//  devPrint ('New Encrypted $newEncrypted');
+//  devPrint ('New Decrypted $newDecrypted');
+//}
+
+String aec1qc(String phKey, String cp) {
+  // Public key generator from private key
+  String p = aec1D(phKey, cp, 24);
+  return aec1Q(p);
+} // end of aec1qc
+
+String aec1sc(String phKey, String cp, String qk) {
+  String p = aec1D(phKey, cp, 24);
+  return aec1S(p, qk);
+} // end of aec1sc
+
+String aec1h(String data) {
+  // Authenium EC 1 hashing function
+  String hashingPadding =
+      '76ad54fc4d31e7ec12375709f438b4bdf0d7e3107ddaf9a0e56bc5ce7afe467d'; // put in secure storage
+  var o = List<int>.filled(16, 0);
+  String hx = hashingPadding.substring(0, 4);
+  int l = data.length;
+
+  for (int i = 0; i < o.length; i++) {
+    hx = hashingPadding.substring(i * 4, i * 4 + 4);
+    o[i] =
+        (data.codeUnitAt(0) *
+            data.codeUnitAt(l - 1) *
+            int.parse(hx, radix: 16)) %
+        65536;
+  }
+
+  for (int c = 0; c < l; c++) {
+    int head = o[0];
+    o = o.sublist(1);
+    int entry = head ^ data.codeUnitAt(c);
+    o.add(entry);
+  }
+
+  String hash = '';
+  for (int c = 0; c < o.length; c++) {
+    String h1 = '000${o[c].toRadixString(16)}';
+    h1 = h1.substring(h1.length - 4, h1.length);
+    hash += h1;
+  }
+  return hash;
+} // end of aec1h
+
+String aec1E1C(String phKey, String cp, String inputData) {
+  // encrypt inputData with aec1 encryption then encode with a64.
+  // encryption key derived from phase phrase key (phKey) and ciphered private key (cp).
+  String p = aec1D(phKey, cp, 24);
+  return aec1E1(p, inputData);
+} // end of aec1e64c
+
+String aec1DC(String phKey, String cp, String inputData) {
+  // encrypt inputData with aec1 encryption then encode with a64.
+  // encryption key derived from phase phrase key (phKey) and ciphered private key (cp).
+  String p = aec1D(phKey, cp, 24);
+  return aec1D(p, inputData, 24);
+} // end of aec1d64c
+
+String aec1Q(String pk) {
+  //   devPrint('AEC1q :');
+  const G =
+      '2c9f4f799eee3b335de8a42a6e51ef90d'
+      '2c81bcbf5a514b0400318998583d39f';
+  int p = 13;
+  int g = 2;
+  String result = '';
+  int pLength = pk.length;
+  if (pLength >= 64) {
+    int loop = 16;
+    String dhKey = '';
+    for (int c = 0; c < loop; c++) {
+      var n4 =
+          int.parse(G.substring(c * 4, c * 4 + 4), radix: 16) *
+          int.parse(pk.substring(c * 4, c * 4 + 4), radix: 16);
+      var n5 = padZero(n4.toRadixString(16), 8);
+      dhKey += n5;
+    }
+    loop = 128;
+    for (int c = 0; c < loop; c++) {
+      int d = int.parse(dhKey.substring(c, c + 1), radix: 16) % p;
+      String q = (pow(g, d) % p).toInt().toRadixString(16);
+      result += q;
+    }
+  }
+  return result;
+} // end of aec1q
+
+String aec1S(String pk, String qk) {
+  // Create shared key from private key and other's public key
+  const G =
+      '2c9f4f799eee3b335de8a42a6e51ef90d'
+      '2c81bcbf5a514b0400318998583d39f';
+  int p = 13;
+  String result = '';
+  int pLength = pk.length;
+  if (pLength >= 64) {
+    int loop = 16;
+    String dhKey = '';
+    for (int c = 0; c < loop; c++) {
+      var n4 =
+          int.parse(G.substring(c * 4, c * 4 + 4), radix: 16) *
+          int.parse(pk.substring(c * 4, c * 4 + 4), radix: 16);
+      var n5 = padZero(n4.toRadixString(16), 8);
+      dhKey += n5;
+    }
+    loop = 128;
+    var dq = List<int>.filled(loop, 0);
+    for (int c = 0; c < loop; c++) {
+      int d = int.parse(dhKey.substring(c, c + 1), radix: 16) % p;
+      dq[c] =
+          pow(int.parse(qk.substring(c, c + 1), radix: 16) % p, d).toInt() % p;
+    }
+
+    int lastS = int.parse(G.substring(G.length - 1, G.length), radix: 16);
+    loop = (loop / 2).round();
+    for (int c = 0; c < loop; c++) {
+      var s = (dq[c * 2] * p + dq[c * 2 + 1] + lastS) % 16;
+      result += s.toRadixString(16);
+      lastS = s;
+    }
+  }
+  return result;
+} // end of aec1s
+//------------------------------------------------------------
+
+String aec1E1(String key, String inputData) {
+  // Authenium EC 1 base A64 encryption function
+  // inputData.length must be even. If odd => add '0' at the front
+  // dart implementation of
+  //   https://docs.google.com/spreadsheets/d/1NZF40himzMKHvBEy2-i29FbIj4B4IOWcdbalZ3UaBpY/edit#gid=26908217
+
+  String rawData;
+  if (inputData.length % 2 == 0) {
+    rawData = nonceGenerator(96) + inputData;
+  } else {
+    rawData = '${nonceGenerator(96)}0$inputData';
+  }
+  int m1 = 13;
+  int m2 = 17;
+  int m3 = 19;
+  int m4 = 23;
+  int encodingVolume = 64;
+  int encryptionModulo = encodingVolume * encodingVolume; //*****^2
+  const kLength = 64;
+
+  int keyByteSize = (key.length / 2).round();
+  var k = List<int>.filled(64, 0);
+  for (int b = 0; b < kLength; b++) {
+    String t1;
+    var t2 = 0;
+    if (b < keyByteSize) {
+      t1 = key.substring(b * 2, b * 2 + 2);
+      t2 = int.parse(t1, radix: 16);
+    }
+    k[b] = t2;
+  }
+
+  var encrypted = '1'; // AEC1 encryption code
+  int v = (k[0] * m1 * m2) % encryptionModulo;
+  int o = 0;
+  int i = 0;
+  int loop = ((rawData.length) / 2).round();
+  for (int c = 0; c < loop; c++) {
+    i = int.parse(
+      rawData.substring(c * 2, c * 2 + 2),
+      radix: 16,
+    ); // take 2 input
+    o = i ^ v;
+    encrypted +=
+        a64[(o / encodingVolume).floor()] + a64[(o % encodingVolume).floor()];
+    if (c < loop - 1) {
+      v =
+          (v * m1 + k[(c + 1) % keyByteSize] * m2 + i * m3 + o * m4) %
+          encryptionModulo;
+    }
+  }
+  return encrypted;
+} // end of aes1E1
+//------------------------------------------------------------
+
+String aec1D(String key, String vEncryptedData, int nonceLength) {
+  // Authenium Elliptic Curve 1 base A64 decryption function
+  // dart implementation of
+  //  https://docs.google.com/spreadsheets/d/1FlgDdtRdqvUJvU0j3S4Lr4CG9nt8fEPPAFZwlS9J5X4/edit#gid=216071792
+  // nonceLength = bit. 24 for general, 8 for qr
+  String encryptedData = vEncryptedData.substring(1);
+  int m1 = 13;
+  int m2 = 17;
+  int m3 = 19;
+  int m4 = 23;
+  int encodingVolume = 64;
+  int encryptionModulo = encodingVolume * encodingVolume;
+  int keyBitSize = 256;
+  int keyStringLength = (keyBitSize / 4).round();
+  int keyByteSize = (keyStringLength / 2).round();
+  const kLength = 64;
+  var decrypted = '';
+  var eCode = vEncryptedData.substring(0, 1);
+  switch (eCode) {
+    case '1':
+      int keyByte = (key.length / 2).round();
+      var k = List<int>.filled(64, 0);
+      for (int b = 0; b < kLength; b++) {
+        String t1;
+        var t2 = 0;
+        if (b < keyByte) {
+          t1 = key.substring(b * 2, b * 2 + 2);
+          t2 = int.parse(t1, radix: 16);
+        } // end if (b < keyByte)
+        k[b] = t2;
+      } // end for (int b = 0; b < kLength; b++)
+
+      String output = '';
+      int v = 0;
+      int o = 0;
+      int i = 0;
+      int loop = ((encryptedData.length) / 2).round();
+      for (int c = 0; c < loop; c++) {
+        int t = c % keyByteSize;
+        if (c == 0) {
+          v = (k[0] * m1 * m2) % encryptionModulo;
+        } else {
+          v = (v * m1 + k[t] * m2 + o * m3 + i * m4) % encryptionModulo;
+        }
+        i =
+            base64ToDec(encryptedData.substring(c * 2, c * 2 + 1)) *
+                encodingVolume +
+            base64ToDec(encryptedData.substring(c * 2 + 1, c * 2 + 2));
+        o = i ^ v;
+        output += padZero(o.toRadixString(16), 2);
+      }
+      //decrypted = output.substring(24).toLowerCase();
+      decrypted = output.substring(nonceLength).toLowerCase();
+      break;
+
+    default:
+      decrypted = vEncryptedData;
+  }
+  return decrypted;
+} // end of aec1D
+//------------------------------------------------------------
+
+String padZero(String hexa, int len) {
+  String tem = ('0' * len) + hexa;
+  return tem.substring(tem.length - len, tem.length);
+}
+
+String nonceGenerator(int bitLen) {
+  var rand = Random.secure();
+  String nonce = '';
+  int len = (bitLen / 4).round();
+  int loop = (len / 5).round() + 1;
+  for (int c = 0; c < loop; c++) {
+    int randNumber = rand.nextInt(99999999);
+    nonce += randNumber.toRadixString(16);
+  }
+  nonce = nonce.substring(nonce.length - len, nonce.length);
+  //   nonce = '9e611040623410122b82331e';
+  return nonce;
+}
+
+// ======================= end of AEC1 family ======================
+
+String aecDecrypt(String input, String inputType) {
+  //  aecDecrypt will try to decrypt with inputType specification
+  //  When fail, will try to decrypt with other keys.
+  //  inputString : raw string begin with encryption version
+  //      0 : no encryption
+  //      1 : encryption version 1 (Proprietary)
+  //      2 : encryption version 2 (AEC)
+  //  inputType : "l" : location  => "6"
+  //              "d" : document  => "P"
+  //              "u" : user      => "_"
+
+  //   Usage : aecDecrypt(inputString, "l");
+  //   final Map<String, String> key = getKeys();
+  String result = '--';
+  String version = input.substring(0, 1);
+  String encrypted = input.substring(1, input.length);
+  bool found = false;
+  String stringType = "6";
+
+  switch (inputType.toLowerCase()) {
+    case "l":
+      stringType = "6";
+      break;
+
+    case "d":
+      stringType = "P";
+      break;
+
+    case "u":
+      stringType = "_";
+      break;
+  } // end of switch inputType
+
+  switch (version) {
+    case '0':
+      result = encrypted;
+      break;
+
+    case '2':
+      try {
+        // trying to decrypt with type from user input
+        result = aec2Decrypt(getAecKey(stringType)!, encrypted);
+        found = true;
+      } catch (e) {
+        found = false;
+      } // end of try 1
+      if (!found) {
+        try {
+          // trying to decrypt with type = 1st character
+          result = aec2Decrypt(
+            getAecKey(encrypted.substring(0, 1))!,
+            encrypted,
+          );
+          found = true;
+        } catch (e) {
+          found = false;
+        } // end of try 2
+      }
+      dynamic ks = getKeyTypes();
+      int len = ks.length;
+      for (int i = 0; !found & (i < len); i++) {
+        // trying to decrypt with all keys available
+        try {
+          result = aec2Decrypt(getAecKey(ks[i])!, encrypted);
+          found = true;
+        } catch (e) {
+          found = false;
+        } // end of try inside for
+      } // end of for
+      break;
+  } // end switch version
+  return result;
+} // end of aecDecryptor
+
+String aec2Decrypt(String key, String encrypted) {
+  // Aec Decrypt version 2
+  // Algorithm from https://docs.google.com/spreadsheets/d/1TMnQ-eCVn0iHALZ-85_t3E-tqMJmMgT_95k_JDxe7FU/edit#gid=216071792
+  const List<int> m = [0, 13, 17, 19, 23, 29]; // Multiplier
+  const encryptionModulo = 4096;
+  const int inputBase = 64;
+  String result = '';
+  List<int> keyVector = [0];
+  int keyByte = (key.length) ~/ 2;
+  for (int i = 1; i <= keyByte; i++) {
+    int cursor = (i - 1) * 2;
+    keyVector.add(int.parse(key.substring(cursor, cursor + 2), radix: 16));
+  }
+  List<int> inputVector = [0];
+  int inputLen = encrypted.length ~/ 2;
+  int keyCursor = 0;
+  int lastPass = 0;
+  int lastXOr = 0;
+  for (int i = 0; i < inputLen; i++) {
+    int cursor = i * 2;
+    int value =
+        base64ToDec(encrypted.substring(cursor, cursor + 1)) * inputBase +
+        base64ToDec(encrypted.substring(cursor + 1, cursor + 2));
+
+    inputVector.add(value);
+    int value2 = 0;
+    int xorValue = 0;
+    if (i == 0) {
+      value2 = (keyVector[i + 1] * m[1] * m[2]) % encryptionModulo;
+      xorValue = value ^ value2;
+    } else {
+      value2 =
+          (lastPass * m[1] +
+              keyVector[keyCursor + 1] * m[2] +
+              lastXOr * m[3] +
+              inputVector[i] * m[4]) %
+          encryptionModulo;
+      xorValue = value ^ value2;
+    } // end if i == 0
+    lastPass = value2;
+    lastXOr = xorValue;
+    keyCursor = (keyCursor + 1) % keyByte;
+    result += a64[xorValue];
+  } // end for inputLen
+  return result.substring(24).toLowerCase();
+} // end of aecDecryptor2
+
+Future<int> getVidUQR(String rawQrText) async {
+  // get vid (integer) from user qr
+
+  // Scheme 3 badges verify themselves; dispatch on the FORMAT, here, before
+  // the legacy stripper below ever sees them. Left alone, a Scheme 3 URL
+  // clears the `http` gate, misses `/qr/`, is handed to aec1D which does not
+  // know version 3, and falls out as -1 -- the exact value that also means
+  // "unrecognised", so no caller can tell a new badge from a bad one.
+  //
+  // The gate goes HERE rather than in a separate wrapper because a wrapper is
+  // opt-in: every later `getVidUQR(...)` -- the obvious call, already written
+  // in four places -- would silently miss Scheme 3 again, and the failure is
+  // silent by construction. Callers that CAN show a reason (scanner.dart) go
+  // to decodeScheme3 directly and never reach this line.
+  //
+  // A legacy scan pays nothing: scheme3Token is a pure string test, so
+  // autheniumKeys -- and Firestore with it -- is never touched for one.
+  if (scheme3Token(rawQrText).isNotEmpty) {
+    return scheme3Vid(rawQrText, await autheniumKeys());
+  }
+
+  String vidValid = emptyString;
+  String qrText = rawQrText;
+  int returnValue = -1;
+
+  if (rawQrText.length >= 4 && rawQrText.substring(0, 4) == 'http') {
+    try {
+      qrText = rawQrText.substring(rawQrText.lastIndexOf('/qr/') + 4);
+      vidValid = aec1D(await getSharedKey(1), qrText, 8);
+      int dLen = vidValid.length;
+      if (uiemsSxHex() == int.parse(vidValid.substring(dLen - 6, dLen))) {
+        vidValid = vidValid.substring(0, dLen - 6);
+        returnValue = int.parse(vidValid, radix: 16);
+      } else {
+        returnValue = -1;
+      } // end if (Hex() == int.parse(vidValid.substring(dLen - 6, dLen)))
+    } catch (e) {
+      returnValue = -1;
+    } // end try
+  } else {
+    returnValue = -1;
+  } // end if (rawQrText.length >= 4 && rawQrText.substring(0, 4) == 'http')
+  return returnValue;
+} // end of getVidUQR
+
+int base64ToDec(String inp) {
+  int result = 0;
+  int prs = inp.codeUnitAt(0);
+  if (65 <= prs && prs <= 90) {
+    result = prs - 65;
+  } else if (97 <= prs && prs <= 122) {
+    result = prs - 71;
+  } else if (48 <= prs && prs <= 57) {
+    result = prs + 4;
+  } else if (prs == 45) {
+    result = 62;
+  } else if (prs == 95) {
+    result = 63;
+  }
+  return result;
+} // end of base64ToDec
+
+String? getAecKey(String keyType) {
+  const Map<String, String> keyMap = {
+    "6": ftzSecretSixCode, // lqr autsorz
+    "P": ftxSecretPCode, // dqr autsorz
+  };
+  return keyMap[keyType];
+} // end of getAecKey
+
+int uiemsSxHex() {
+  // user qr marker
+  String s1 = '577000';
+  return ((int.parse(s1) - 988) / 3).floor() + 10003;
+}
+
+List<String> getKeyTypes() {
+  // get all kind of 1st char in qr code
+  return ['6', 'P', "_"];
+} // end of getKeyTypes
+
+// ====================== Scheme 3 (Ed25519) family ======================
+// Offline decoder and verifier for Scheme 3 QR tokens -- the new user-badge
+// format, running ALONGSIDE the existing getVidUQR path, not replacing it.
+//
+// A Scheme 3 token is an Ed25519-signed (RFC 8032) binary blob, base64url
+// encoded behind a '3' prefix, scanned bare ('3MQET...') or wrapped in a URL
+// ('https://autsorz/l/3MQET...').
+//
+//   byte 0        high nibble = typeId, low nibble reserved (observed 1)
+//   byte 1        keyVersion (1..255)
+//   bytes 2..n-64 payload, layout depends on typeId
+//   last 64 bytes Ed25519 signature over bytes[0 .. n-64] -- header IS signed
+//
+// UNLIKE every other family in this file, Scheme 3 uses NO secret: the public
+// keyring is fetched from a public Firestore collection. That fetch lives in
+// lib/firestore_repository/authenium_keys.dart, deliberately kept out of here
+// so this file stays Firebase-free and deterministic.
+//
+// What a valid signature proves, and what it does not: the token was minted by
+// the issuer, NOT that the holder is still authorised. Ed25519 has no per-token
+// revocation -- rotating a key version revokes everyone signed with it -- and a
+// photograph of a valid badge is a valid badge. Callers keep their table lookup
+// for revocation, and pair with GPS/selfie where replay matters.
+
+/// Why a Scheme 3 token was or was not accepted.
+///
+/// Deliberately not collapsed into a single "invalid": three of these are not a
+/// forgery and have different remedies (sync the keyring, update the app,
+/// re-scan a real badge).
+/// keyVersion -> every 32-byte public key published under that version.
+///
+/// A LIST per version, not one key: key versions are numbered per tenant, so
+/// several tenants each publish a version `1` with different bytes. Holding
+/// them side by side is what lets a badge from any published tenant verify.
+///
+/// Narrowing this to a single tenant restores the crypto-level tenant boundary
+/// — see `autheniumKeys(tenantId:)`.
+typedef Scheme3Keyring = Map<int, List<List<int>>>;
+
+enum Scheme3Status {
+  /// Signature verified and payload unpacked.
+  ok,
+
+  /// Not a Scheme 3 token at all (wrong prefix, empty input).
+  notScheme3,
+
+  /// Scheme 3 shape, but the bytes do not parse: bad base64, too short, or a
+  /// payload the wrong size for its type.
+  malformed,
+
+  /// Signed with a key version this device does not hold. The badge may be
+  /// perfectly good -- the device needs to sync.
+  unknownKeyVersion,
+
+  /// The signature does not match. This is the forgery signal.
+  badSignature,
+
+  /// Signature verified, but the token is of a type this build cannot read.
+  unsupportedType,
+}
+
+/// A decoded Scheme 3 token.
+class Scheme3Result {
+  final Scheme3Status status;
+
+  /// `'user'`, `'location'`, `'asset'`, `'other'`, or `''` when not decoded.
+  final String type;
+
+  /// Key version from header byte 1. 0 when the header was never read.
+  final int keyVersion;
+
+  /// The single identifier a caller looks up. Empty unless [status] is
+  /// [Scheme3Status.ok].
+  final String value;
+
+  /// Raw location subtype id. Only set for `type == 'location'`.
+  ///
+  /// ponytail: the id is exposed, not a label. Mapping id -> name here would
+  /// hardcode the platform's subtype table in the client and make adding a
+  /// subtype an app release. If a screen ever needs the label, put the table in
+  /// the screen JSON.
+  final int? subtypeId;
+
+  /// Short reason, for devPrint only. Never shown to a user.
+  final String detail;
+
+  const Scheme3Result({
+    required this.status,
+    this.type = '',
+    this.keyVersion = 0,
+    this.value = '',
+    this.subtypeId,
+    this.detail = '',
+  });
+
+  bool get isValid => status == Scheme3Status.ok;
+
+  @override
+  String toString() =>
+      'Scheme3Result(${status.name}, type: $type, '
+      'keyVer: $keyVersion, value: $value, detail: $detail)';
+}
+
+final RegExp _hex64 = RegExp(r'^[0-9a-fA-F]{64}$');
+
+/// Parses one public key into 32 raw bytes, accepting hex or base64url.
+///
+/// Returns an EMPTY list for anything that is not exactly 32 bytes. Callers
+/// treat empty as "no key", so one malformed entry in the Firestore keyring
+/// disables that single version instead of throwing -- this runs inside a
+/// snapshot listener, where a throw becomes an uncaught async error.
+List<int> scheme3ParseKey(String raw) {
+  final String key = raw.trim();
+  if (key.isEmpty) return const [];
+
+  // Hex is detected by its alphabet, not by its length: a 64-character
+  // base64url string is legal too and a length-only test would mangle it.
+  if (_hex64.hasMatch(key)) {
+    final out = Uint8List(32);
+    for (int i = 0; i < 32; i++) {
+      out[i] = int.parse(key.substring(i * 2, i * 2 + 2), radix: 16);
+    }
+    return out;
+  }
+
+  try {
+    // base64.normalize maps -/_ to +//, adds padding and validates length.
+    final Uint8List bytes = base64.decode(base64.normalize(key));
+    return bytes.length == 32 ? bytes : const [];
+  } on FormatException {
+    return const [];
+  }
+}
+
+/// The uid shared by the location and asset payloads: 3 bytes of header, then
+/// the identifier itself.
+///
+/// Two layouts are live. The current minter writes 16 cryptographic random
+/// bytes rendered as a 23-character Scheme 0 id -- `'0'` plus unpadded
+/// base64url -- which reproduces the developer guide's own
+/// `0sJ4sy7f4FQVE4-rYyd95bg` sample byte for byte. The older 5-byte decimal
+/// uid is kept because the vendor's final reference decoder still emits it, so
+/// tags in that shape may be in the field.
+///
+/// The 16-byte form is tried FIRST on purpose: a 19-byte payload read under the
+/// 5-byte rule returns `ok` carrying a plausible but wrong id, and a wrong
+/// identifier that looks right is worse than a refusal.
+String _scheme3Uid(List<int> payload) {
+  if (payload.length >= 19) {
+    return '0${base64Url.encode(payload.sublist(3, 19)).replaceAll('=', '')}';
+  }
+  return _bigEndian(payload, 3, 8).toString();
+}
+
+/// Unpacks an already-VERIFIED payload.
+///
+/// Pure and synchronous, and exported so tests can reach the type dispatch
+/// without a signature -- including the unsupported-type branch, which cannot
+/// be reached through [decodeScheme3] without the issuer's private key.
+Scheme3Result scheme3Unpack(int typeId, int keyVersion, List<int> payload) {
+  Scheme3Result bad(String detail) => Scheme3Result(
+    status: Scheme3Status.malformed,
+    keyVersion: keyVersion,
+    detail: detail,
+  );
+
+  switch (typeId) {
+    case 3: // User badge: 6-byte big-endian VID.
+      if (payload.length != 6) {
+        return bad('user payload ${payload.length}B, expected 6');
+      }
+      return Scheme3Result(
+        status: Scheme3Status.ok,
+        type: 'user',
+        keyVersion: keyVersion,
+        value: _bigEndian(payload, 0, 6).toString().padLeft(14, '0'),
+      );
+
+    case 1: // Location: 2B country, 1B subtype, then the uid.
+      if (payload.length < 8) {
+        return bad('location payload ${payload.length}B, expected >= 8');
+      }
+      return Scheme3Result(
+        status: Scheme3Status.ok,
+        type: 'location',
+        keyVersion: keyVersion,
+        value: _scheme3Uid(payload),
+        subtypeId: payload[2],
+      );
+
+    case 2: // Asset: 3B UNSPSC, then the uid.
+      if (payload.length < 3) {
+        return bad('asset payload ${payload.length}B, expected >= 3');
+      }
+      final int unspsc = _bigEndian(payload, 0, 3);
+      // The uid is the identity a caller looks up; UNSPSC is a classification,
+      // so it stands in as the value only when there is no uid to return.
+      final String value = payload.length >= 8
+          ? _scheme3Uid(payload)
+          : unspsc.toString().padLeft(unspsc < 10000 ? 4 : 6, '0');
+      return Scheme3Result(
+        status: Scheme3Status.ok,
+        type: 'asset',
+        keyVersion: keyVersion,
+        value: value,
+      );
+
+    case 4: // Other / IoT: payload[0] reserved, 6B entity id, then metadata.
+      if (payload.length < 7) {
+        return bad('other payload ${payload.length}B, expected >= 7');
+      }
+      return Scheme3Result(
+        status: Scheme3Status.ok,
+        type: 'other',
+        keyVersion: keyVersion,
+        value: _bigEndian(payload, 1, 7).toString().padLeft(14, '0'),
+      );
+
+    default:
+      // The integration guide returns isValid:true here. It must not: a token
+      // this build cannot interpret is not a token this build may accept.
+      return Scheme3Result(
+        status: Scheme3Status.unsupportedType,
+        keyVersion: keyVersion,
+        detail: 'typeId $typeId unknown to this build',
+      );
+  }
+}
+
+/// Decodes and cryptographically verifies a Scheme 3 QR.
+///
+/// [input] is the scanned URL or the bare token. [keys] maps key version to 32
+/// raw public-key bytes.
+///
+/// Never throws: every failure comes back as a [Scheme3Status].
+/// The Scheme 3 token inside [input], or `''` when this is not one.
+///
+/// Takes whatever follows the LAST `/` and checks the `3` version prefix. Pure,
+/// cheap, and free of both crypto and the keyring, so a caller can decide WHICH
+/// decoder to run before paying for either.
+///
+/// ★ The path segment carries NO information — production has minted Scheme 3
+/// user badges at `https://autsorz.com/qr/3MQE…` (the SAME `/qr/` path the
+/// legacy encrypted badges use) and at `https://autsorz.com/u/3Z86…`, while
+/// `flutter_integration_guide.md` documents `https://autsorz/l/3…`. Keying on
+/// any one of those silently misses every badge minted under the others, so
+/// only the `3` prefix may decide.
+///
+/// ★★★ Do NOT cut at the LAST `/`. A Base45 body contains `/` — it is in the
+/// RFC 9285 alphabet — so the old rule sliced a real badge
+/// (`…4OEX/KP*A` → `KP*A`) into rubble that then fell through to [getVidUQR]
+/// and surfaced as "unrecognised", with nothing in the log to say why. The cut
+/// is at the FIRST `/3`, which is always the URL's own delimiter: every `/`
+/// the token itself owns lies to the right of the token's start.
+///
+/// A bare token (no URL) is returned untouched, so a `/3` occurring INSIDE its
+/// body is never mistaken for a delimiter.
+///
+/// Legacy badges stay unclaimed on the prefix alone: their a64 cipher starts
+/// with the aec version character (`1` or `2`), never `3`, and holds no `/`.
+///
+/// Dispatch on this, not on the failure. A Scheme 3 URL reaching [getVidUQR]
+/// clears its `http` gate, has its `/qr/` stripped, is handed to [aec1D] which
+/// does not know version `3` and returns the input untouched, and falls out as
+/// `-1` — the exact value that also means "unrecognised badge".
+String scheme3Token(String input) {
+  final String trimmed = input.trim();
+  if (trimmed.isEmpty) return '';
+  if (trimmed[0] == '3') return trimmed;
+  final int mark = trimmed.indexOf('/3');
+  return mark >= 0 ? trimmed.substring(mark + 1) : '';
+}
+
+/// RFC 9285 alphabet. `$` is escaped; the SPACE at index 36 is significant —
+/// real badges carry one, and it survives only because [scheme3Token] trims
+/// the ends and nothing in between.
+const String _base45Alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ \$%*+-./:';
+
+/// Decodes RFC 9285 Base45. Returns `[]` for anything that is not valid Base45
+/// — an out-of-alphabet character (lowercase, `_`), a leftover single char, or
+/// a group whose value overflows its byte width.
+///
+/// Rejecting rather than salvaging is what makes this usable as the first half
+/// of a two-encoding probe: base64url bodies almost always carry lowercase, so
+/// they land here as `[]` and fall through. See [decodeScheme3].
+List<int> scheme3Base45Decode(String s) {
+  final List<int> v = <int>[];
+  for (int i = 0; i < s.length; i++) {
+    final int d = _base45Alphabet.indexOf(s[i]);
+    if (d < 0) return const <int>[];
+    v.add(d);
+  }
+  // 2 chars -> 1 byte, 3 chars -> 2 bytes. A lone trailing char encodes nothing.
+  if (v.length % 3 == 1) return const <int>[];
+
+  final List<int> out = <int>[];
+  int i = 0;
+  for (; i + 3 <= v.length; i += 3) {
+    final int n = v[i] + v[i + 1] * 45 + v[i + 2] * 2025;
+    if (n > 0xFFFF) return const <int>[];
+    out.add(n >> 8);
+    out.add(n & 0xFF);
+  }
+  if (i < v.length) {
+    final int n = v[i] + v[i + 1] * 45;
+    if (n > 0xFF) return const <int>[];
+    out.add(n);
+  }
+  return out;
+}
+
+/// Decodes and cryptographically verifies a Scheme 3 QR.
+///
+/// [input] is the scanned URL or the bare token. [keys] maps key version to the
+/// candidate public keys published under it — see [Scheme3Keyring].
+///
+/// Every candidate for the token's version is tried and the token is accepted
+/// if ANY verifies, which is what lets a badge from any published tenant pass.
+/// With a single-tenant keyring that loop runs exactly once.
+///
+/// Never throws: every failure comes back as a [Scheme3Status].
+Future<Scheme3Result> decodeScheme3(String input, Scheme3Keyring keys) async {
+  final String token = scheme3Token(input);
+  if (token.isEmpty) {
+    return const Scheme3Result(
+      status: Scheme3Status.notScheme3,
+      detail: 'prefix is not 3',
+    );
+  }
+
+  // TWO encodings are live. The guides document base64url; production mints
+  // Base45 (sheet column I, and every badge seen on a real card). Base45 is
+  // tried FIRST because it is the stricter alphabet: a base64url body carrying
+  // any lowercase or `_` decodes to `[]` here and falls through, whereas a
+  // Base45 body handed to base64 throws on its space, `*`, `.`, `:`, `%`, `$`.
+  //
+  // The 67-byte floor, not merely "it decoded", is what selects: a 96-char
+  // base64url token IS valid Base45 and yields 64 bytes, which is short. So the
+  // fallback is genuinely reachable rather than dead — the case that reaches it
+  // is an all-uppercase base64url token, covered by test.
+  //
+  // A wrong guess can only under-accept: header and payload are both inside the
+  // signed message, so a misread badge fails verification. It never yields a
+  // wrong VID.
+  final String body = token.substring(1);
+  final List<int> b45 = scheme3Base45Decode(body);
+  Uint8List raw;
+  if (b45.length >= 67) {
+    raw = Uint8List.fromList(b45);
+  } else {
+    try {
+      raw = base64.decode(base64.normalize(body));
+    } on FormatException catch (e) {
+      return Scheme3Result(
+        status: Scheme3Status.malformed,
+        detail: 'base45 ${b45.length}B, base64: ${e.message}',
+      );
+    }
+  }
+
+  // 2 header + at least 1 payload byte + 64 signature.
+  if (raw.length < 67) {
+    return Scheme3Result(
+      status: Scheme3Status.malformed,
+      detail: 'token ${raw.length}B, minimum 67',
+    );
+  }
+
+  // Header byte 0: high nibble = type, low nibble = format version.
+  final int typeId = (raw[0] >> 4) & 0x0F;
+  final int formatVersion = raw[0] & 0x0F;
+  final int keyVersion = raw[1];
+  final int msgLen = raw.length - 64;
+
+  // Checked BEFORE the signature, so a test can reach this branch without the
+  // issuer's private key. Nothing is given away by the ordering: the forger
+  // writes the header, so anyone who wants the badSignature reply instead can
+  // simply put a 1 here.
+  //
+  // Ungated, a future format 2 -- same type id, different payload layout --
+  // would be unpacked under version 1 rules and returned as `ok` carrying a
+  // wrong VID. A format this build has never seen has no safe reading.
+  if (formatVersion != 1) {
+    return Scheme3Result(
+      status: Scheme3Status.unsupportedType,
+      keyVersion: keyVersion,
+      detail: 'format version $formatVersion, this build reads 1',
+    );
+  }
+
+  final List<List<int>> candidates = (keys[keyVersion] ?? const <List<int>>[])
+      .where((k) => k.length == 32)
+      .toList();
+  if (candidates.isEmpty) {
+    return Scheme3Result(
+      status: Scheme3Status.unknownKeyVersion,
+      keyVersion: keyVersion,
+      detail: 'no 32-byte key for version $keyVersion',
+    );
+  }
+
+  // The signature covers the header as well as the payload, so type and key
+  // version cannot be swapped without breaking it.
+  //
+  // Several tenants publish a version 1, so this tries each candidate and
+  // accepts on the first that verifies. Ed25519 verification is not secret-
+  // dependent, so trying a wrong key leaks nothing.
+  final List<int> message = raw.sublist(0, msgLen);
+  final List<int> sigBytes = raw.sublist(msgLen);
+  bool verified = false;
+  for (final List<int> pub in candidates) {
+    verified = await ed.Ed25519().verify(
+      message,
+      signature: ed.Signature(
+        sigBytes,
+        publicKey: ed.SimplePublicKey(pub, type: ed.KeyPairType.ed25519),
+      ),
+    );
+    if (verified) break;
+  }
+  if (!verified) {
+    return Scheme3Result(
+      status: Scheme3Status.badSignature,
+      keyVersion: keyVersion,
+      detail: 'signature mismatch vs ${candidates.length} key(s)',
+    );
+  }
+
+  return scheme3Unpack(typeId, keyVersion, raw.sublist(2, msgLen));
+}
+
+/// The VID a Scheme 3 badge yields, or `-1` — the same failure sentinel
+/// [getVidUQR] has always returned, and the one every caller already tests
+/// (`ftz_checker.dart`, `getQRContent`).
+///
+/// Collapsing five statuses into one number DOES lose the reason, and that
+/// loss is real: `unknownKeyVersion` deserves "kunci belum tersinkron,
+/// sambungkan internet", not "QR salah". It is accepted here only because the
+/// `int` callers have never been able to say anything else. A screen that CAN
+/// tell the operator why — `scanner.dart` — must keep calling [decodeScheme3]
+/// directly and reading the status.
+///
+/// ★★★ `ok` is NOT enough — the type must be `user`. A LOCATION badge signed
+/// by a published key verifies perfectly and, when its payload is short enough
+/// to take the numeric branch of [scheme3Unpack], hands back a plain number:
+/// the guide's own location vector unpacks to `101`. Returned unguarded, a
+/// point badge scanned on a `uqr` screen becomes "VID 101" and the operator is
+/// told a person is missing from the workforce list rather than that they
+/// scanned the wrong kind of card. The table lookup happens to stop it from
+/// going further — that is luck, not a check.
+///
+/// [keys] arrives as a parameter rather than being fetched, which is what
+/// keeps this whole mapping testable with no Firebase at all.
+/// The location code a Scheme 3 point badge yields, or `''`.
+///
+/// The `String` twin of [scheme3Vid], for [lqrVerify]'s callers. `value` for a
+/// 19-byte point payload is already a `'0'`-prefixed 23-char id — the shape the
+/// publisher writes in its own `Location ID` column — so it is returned
+/// untouched and looked up in `#LQR_LIST` exactly as a legacy code is.
+///
+/// ★★★ `ok` is not enough here either: a verified USER badge is a 14-digit
+/// number, and returning it would have `getQRContent` look a person up in the
+/// geofence table. The type is inside the signed message, so the test is free.
+Future<String> scheme3LqrCode(String raw, Scheme3Keyring keys) async {
+  final Scheme3Result r = await decodeScheme3(raw, keys);
+  if (r.status != Scheme3Status.ok || r.type != 'location') return '';
+
+  // ★★★ Return the id WITH its leading '0'. Measured, not reasoned: a live
+  // `#LQR_LIST` on a real device holds keys like
+  // `0lefc05bc4c884bd590a3a13c8d99663b1dfd371d8` -- the marker is part of the
+  // key. An earlier version stripped it, on the strength of `lqr_code_test`
+  // round-tripping `makeLqrCode` through `lqrVerify` as `code.substring(1)`;
+  // that test feeds makeLqrCode's output straight in as if it were the whole
+  // QR string, and makeLqrCode calls ITSELF a stand-in for a generator whose
+  // real algorithm is unknown. It describes the mechanics, never production.
+  //
+  // So a real location QR is '0' + the id, aecDecrypt eats the outer version
+  // character, and what comes back still opens with the id's own '0'. Scheme 3
+  // hands back exactly what the publisher writes in its `Location ID` column,
+  // and that column keeps the marker too.
+  return r.value;
+}
+
+Future<int> scheme3Vid(String raw, Scheme3Keyring keys) async {
+  final Scheme3Result r = await decodeScheme3(raw, keys);
+  // The status test is redundant TODAY -- `type` is only ever set to 'user'
+  // after verification, so the second half already covers it, and a mutation
+  // deleting the first half survives. Kept anyway: leaning on that coupling
+  // means one future edit that sets `type` in a failure branch opens the gate
+  // silently. A test pins the invariant rather than trusting it.
+  if (r.status != Scheme3Status.ok || r.type != 'user') return -1;
+  // ponytail: unreachable today -- a verified user payload is a uint48, so it
+  // always parses. Kept because the alternative is int.parse throwing out of a
+  // function whose whole contract is "a VID, or -1"; no caller handles a throw.
+  return int.tryParse(r.value) ?? -1;
+}
+
+int _bigEndian(List<int> bytes, int start, int end) {
+  int out = 0;
+  for (int i = start; i < end; i++) {
+    out = (out << 8) | bytes[i];
+  }
+  return out;
+}
+
+// =================== end of Scheme 3 family ===================
